@@ -1,4 +1,4 @@
-score = int(input('Input Score: '))
+score = int(input('점수를 입력하세요: '))
 if 90 <= score <= 100:
     grade = "A"
 elif 80 <= score < 90:
