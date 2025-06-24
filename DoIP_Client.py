@@ -5,19 +5,17 @@ import struct
 import threading
 import queue
 import binascii
-import time # [추가] time.sleep을 위해 추가
+import time
 
-# --- DoIP 프로토콜 로직 처리 클래스 (일부 수정) ---
+# --- DoIP 프로토콜 로직 처리 클래스 (수정됨) ---
 class DoIPClient:
-    """DoIP 통신의 핵심 로직을 담당하는 클래스"""
-
-    # DoIP 프로토콜 상수
     PROTOCOL_VERSION = 0x02
     PAYLOAD_TYPE_ROUTING_ACTIVATION_REQUEST = 0x0005
     PAYLOAD_TYPE_ROUTING_ACTIVATION_RESPONSE = 0x0006
     PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE = 0x8001
     PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE_ACK = 0x8002
     PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE_NACK = 0x8003
+    FUNCTIONAL_TARGET_ADDRESS = 0xFFFF # [추가] Functional 주소 정의
 
     def __init__(self, log_callback):
         self.server_ip = None
@@ -36,6 +34,7 @@ class DoIPClient:
         return header
 
     def connect(self, server_ip):
+        # ... (이전 코드와 동일, 변경 없음)
         self.server_ip = server_ip
         try:
             self._log(f"Connecting to {self.server_ip}:{self.tcp_port}...")
@@ -50,63 +49,59 @@ class DoIPClient:
             return False
 
     def send_routing_activation(self, source_addr):
-        if not self.is_connected:
-            self._log("Error: Not connected.")
-            return None
-            
+        # ... (이전 코드와 동일, 변경 없음)
+        if not self.is_connected: return None
         try:
             payload = struct.pack('>HBxxxx', source_addr, 0x00)
             header = self._create_doip_header(self.PAYLOAD_TYPE_ROUTING_ACTIVATION_REQUEST, len(payload))
             message = header + payload
-
             self._log(f"Sending Routing Activation Request...")
-            self._log(f"  - Payload: {binascii.hexlify(payload).decode('ascii').upper()}")
             self.tcp_socket.sendall(message)
-
-            response = self._receive_tcp()
-            return response
+            return self._receive_tcp()
         except socket.error as e:
             self._log(f"Error during routing activation: {e}")
             self.disconnect()
             return None
 
-    # [추가] Tester Present 전용 전송 메서드
-    def send_tester_present(self, source_addr, target_addr):
+    # [변경] Functional/Physical 타입을 처리하도록 메서드 수정
+    def send_tester_present(self, source_addr, physical_target_addr, message_type):
         """Tester Present 메시지를 보내고 응답은 기다리지 않습니다."""
         if not self.is_connected:
-            return # 연결이 끊기면 조용히 종료
+            return
 
         try:
-            uds_data = b'\x3E\x00' # UDS Payload: Tester Present, zeroSubFunction
+            if message_type == "Functional":
+                target_addr = self.FUNCTIONAL_TARGET_ADDRESS
+                uds_data = b'\x3E\x80'  # 3E 80 (suppressPosRsp)
+                log_msg = f"Sending Functional Tester Present: {binascii.hexlify(uds_data).decode('ascii').upper()}"
+            else:  # "Physical"
+                target_addr = physical_target_addr
+                uds_data = b'\x3E\x00'  # 3E 00
+                log_msg = f"Sending Physical Tester Present: {binascii.hexlify(uds_data).decode('ascii').upper()}"
+
             payload = struct.pack('>HH', source_addr, target_addr) + uds_data
             header = self._create_doip_header(self.PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE, len(payload))
             message = header + payload
 
-            self._log(f"Sending Tester Present: {binascii.hexlify(uds_data).decode('ascii').upper()}")
+            self._log(log_msg)
             self.tcp_socket.sendall(message)
-            # 이 함수는 응답을 기다리지 않음
         except socket.error as e:
             self._log(f"Error sending Tester Present: {e}")
             self.disconnect()
 
     def send_diagnostic_message(self, source_addr, target_addr, uds_data):
-        if not self.is_connected:
-            self._log("Error: Not connected.")
-            return None
-
+        # ... (이전 코드와 동일, 변경 없음)
+        if not self.is_connected: return None
         try:
             payload = struct.pack('>HH', source_addr, target_addr) + uds_data
             header = self._create_doip_header(self.PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE, len(payload))
             message = header + payload
-
             self._log(f"Sending Diagnostic Message...")
             self._log(f"  - UDS Data: {binascii.hexlify(uds_data).decode('ascii').upper()}")
             self.tcp_socket.sendall(message)
-
             ack_response = self._receive_tcp()
             if ack_response and ack_response['type'] == self.PAYLOAD_TYPE_DIAGNOSTIC_MESSAGE_ACK:
-                diag_response = self._receive_tcp()
-                return diag_response
+                return self._receive_tcp()
             else:
                 self._log("Did not receive positive ACK for diagnostic message.")
                 return None
@@ -115,17 +110,17 @@ class DoIPClient:
             self.disconnect()
             return None
 
+
     def _receive_tcp(self):
+        # ... (이전 코드와 동일, 변경 없음)
         try:
             header_data = self.tcp_socket.recv(8)
             if not header_data:
                 self._log("Connection closed by server.")
                 self.disconnect()
                 return None
-
             _, _, payload_type, payload_length = struct.unpack('>BBHL', header_data)
             self._log(f"Received Message: Type={hex(payload_type)}, Length={payload_length}")
-            
             payload_data = b''
             if payload_length > 0:
                 received_len = 0
@@ -135,7 +130,6 @@ class DoIPClient:
                     payload_data += chunk
                     received_len += len(chunk)
                 self._log(f"  - Payload: {binascii.hexlify(payload_data).decode('ascii').upper()}")
-            
             return {'type': payload_type, 'length': payload_length, 'payload': payload_data}
         except socket.timeout:
             self._log("Receive timed out.")
@@ -145,7 +139,9 @@ class DoIPClient:
             self.disconnect()
             return None
 
+
     def disconnect(self):
+        # ... (이전 코드와 동일, 변경 없음)
         if self.tcp_socket:
             self.tcp_socket.close()
             self.tcp_socket = None
@@ -157,16 +153,17 @@ class DoIPClient:
 class DoIPClientApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Python DoIP Client (Auto Tester Present)")
-        self.root.geometry("650x550")
+        self.root.title("Python DoIP Client (Tester Present Select)")
+        self.root.geometry("650x580") # 높이 살짝 조정
 
         self.log_queue = queue.Queue()
         self.doip_client = DoIPClient(self.queue_log)
 
-        # [추가] Tester Present 스레드 관리를 위한 변수
         self.tester_present_thread = None
         self.tester_present_active = False
-        self.auto_tester_present_var = tk.BooleanVar(value=True) # 체크박스 상태 변수
+        self.auto_tester_present_var = tk.BooleanVar(value=True)
+        # [추가] 라디오 버튼 상태 관리를 위한 변수, 기본값 "Functional"
+        self.tester_present_type_var = tk.StringVar(value="Functional") 
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -200,10 +197,20 @@ class DoIPClientApp:
         self.target_addr_entry.grid(row=0, column=3, padx=5, pady=5, sticky="w")
         self.target_addr_entry.insert(0, "1000")
         
-        # [추가] Tester Present 자동 전송 체크박스
-        self.tester_present_check = ttk.Checkbutton(action_frame, text="Auto Tester Present (2s)", variable=self.auto_tester_present_var)
-        self.tester_present_check.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+        # [변경] Tester Present 관련 옵션을 한 줄에 배치
+        tp_options_frame = ttk.Frame(action_frame)
+        tp_options_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=5)
         
+        self.tester_present_check = ttk.Checkbutton(tp_options_frame, text="Auto Tester Present (2s)", variable=self.auto_tester_present_var)
+        self.tester_present_check.pack(side=tk.LEFT, padx=(0, 20))
+
+        # [추가] Functional/Physical 선택 라디오 버튼
+        functional_radio = ttk.Radiobutton(tp_options_frame, text="Functional", variable=self.tester_present_type_var, value="Functional")
+        functional_radio.pack(side=tk.LEFT, padx=5)
+        
+        physical_radio = ttk.Radiobutton(tp_options_frame, text="Physical", variable=self.tester_present_type_var, value="Physical")
+        physical_radio.pack(side=tk.LEFT, padx=5)
+
         ttk.Label(action_frame, text="UDS Payload (Hex):").grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
         self.uds_entry = ttk.Entry(action_frame, width=40)
         self.uds_entry.grid(row=3, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
@@ -218,17 +225,20 @@ class DoIPClientApp:
         self.log_area = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, width=80, height=20)
         self.log_area.pack(fill="both", expand=True)
         self.log_area.configure(state='disabled')
-        
+
     def log(self, message):
+        # ... (이전 코드와 동일, 변경 없음)
         self.log_area.configure(state='normal')
         self.log_area.insert(tk.END, message + "\n")
         self.log_area.configure(state='disabled')
         self.log_area.see(tk.END)
 
     def queue_log(self, message):
+        # ... (이전 코드와 동일, 변경 없음)
         self.log_queue.put(message)
 
     def process_queue(self):
+        # ... (이전 코드와 동일, 변경 없음)
         try:
             while True:
                 message = self.log_queue.get_nowait()
@@ -238,41 +248,37 @@ class DoIPClientApp:
         self.root.after(100, self.process_queue)
 
     def _run_in_thread(self, target_func, *args):
+        # ... (이전 코드와 동일, 변경 없음)
         thread = threading.Thread(target=target_func, args=args, daemon=True)
         thread.start()
 
     def connect_and_activate(self):
+        # ... (이전 코드와 동일, 변경 없음)
         ip = self.ip_entry.get()
         if not ip:
             self.log("Please enter a server IP.")
             return
-        
         try:
             source_addr = int(self.source_addr_entry.get(), 16)
         except ValueError:
             self.log("Invalid hex value for Source Address.")
             return
-
         self._run_in_thread(self._connect_and_activate_worker, ip, source_addr)
         self.connect_button.config(state="disabled")
 
     def _connect_and_activate_worker(self, ip, source_addr):
+        # ... (이전 코드와 동일, 변경 없음)
         if not self.doip_client.connect(ip):
             self.queue_log("-> Process failed.")
             self.connect_button.config(state="normal")
             return
-
         self.queue_log("Connection successful.")
         response = self.doip_client.send_routing_activation(source_addr)
-
         if (response and response['type'] == self.doip_client.PAYLOAD_TYPE_ROUTING_ACTIVATION_RESPONSE and
                 len(response['payload']) >= 5 and response['payload'][4] == 0x10):
-            
             self.queue_log("Routing activation successful.")
             self.disconnect_button.config(state="normal")
             self.send_diag_button.config(state="normal")
-            
-            # [추가] 연결 성공 시 Tester Present 스레드 시작
             if self.auto_tester_present_var.get():
                 self.start_tester_present()
         else:
@@ -280,46 +286,48 @@ class DoIPClientApp:
             self.doip_client.disconnect()
             self.connect_button.config(state="normal")
 
-    # [추가] Tester Present 스레드 시작 함수
     def start_tester_present(self):
+        # ... (이전 코드와 동일, 변경 없음)
         if not self.tester_present_active:
             self.tester_present_active = True
             self.tester_present_thread = threading.Thread(target=self._tester_present_worker, daemon=True)
             self.tester_present_thread.start()
             self.queue_log("[+] Auto Tester Present started.")
-
-    # [추가] Tester Present 스레드 중지 함수
+            
     def stop_tester_present(self):
+        # ... (이전 코드와 동일, 변경 없음)
         if self.tester_present_active:
             self.tester_present_active = False
-            # 스레드가 완전히 종료될 때까지 잠시 기다릴 수 있음
             if self.tester_present_thread and self.tester_present_thread.is_alive():
                 self.tester_present_thread.join(timeout=0.5)
             self.queue_log("[-] Auto Tester Present stopped.")
-            
-    # [추가] Tester Present를 주기적으로 보내는 워커 함수 (스레드에서 실행됨)
+
+    # [변경] 라디오 버튼 값을 읽어와서 DoIPClient 메서드로 전달
     def _tester_present_worker(self):
         try:
             source_addr = int(self.source_addr_entry.get(), 16)
-            target_addr = int(self.target_addr_entry.get(), 16)
+            physical_target_addr = int(self.target_addr_entry.get(), 16)
+            message_type = self.tester_present_type_var.get() # 라디오 버튼 값 읽기
         except ValueError:
             self.queue_log("Error: Invalid address format for Tester Present.")
-            self.tester_present_active = False # 오류 발생 시 루프 중단
+            self.tester_present_active = False
             return
 
         while self.tester_present_active:
-            self.doip_client.send_tester_present(source_addr, target_addr)
-            time.sleep(2) # 2초 대기
+            # message_type을 인자로 전달
+            self.doip_client.send_tester_present(source_addr, physical_target_addr, message_type)
+            time.sleep(2)
             
-    # [변경] disconnect 함수에 스레드 중지 로직 추가
     def disconnect(self):
-        self.stop_tester_present() # 연결 끊기 전에 스레드부터 중지
+        # ... (이전 코드와 동일, 변경 없음)
+        self.stop_tester_present()
         self.doip_client.disconnect()
         self.connect_button.config(state="normal")
         self.disconnect_button.config(state="disabled")
         self.send_diag_button.config(state="disabled")
 
     def send_diag(self):
+        # ... (이전 코드와 동일, 변경 없음)
         try:
             source_addr = int(self.source_addr_entry.get(), 16)
             target_addr = int(self.target_addr_entry.get(), 16)
@@ -331,9 +339,9 @@ class DoIPClientApp:
         except binascii.Error:
             self.log("Invalid hex string for UDS payload.")
 
-    # [변경] on_closing 함수에 스레드 중지 로직 추가
     def on_closing(self):
-        self.stop_tester_present() # 프로그램 종료 전 스레드 중지
+        # ... (이전 코드와 동일, 변경 없음)
+        self.stop_tester_present()
         if self.doip_client.is_connected:
             self.doip_client.disconnect()
         self.root.destroy()
