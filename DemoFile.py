@@ -4,4 +4,4 @@ f.close()
 
 f = open("DemoFile.txt", "rt", encoding="utf-8")
 print(f.read())
-f.close
+f.close()
