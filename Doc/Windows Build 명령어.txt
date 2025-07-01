@@ -1,0 +1,22 @@
+======================================
+환경 설정
+======================================
+1. IDE 설치 : Visual Sutdio Code
+   1) Extended > Python
+   2) Korean Language Pack
+   3) GitHub Copilot
+   4) Excel Viewer
+
+2. PIP 설치 방법
+   : pip install -r requirements.txt
+
+3. PIP 설치 목록 보기
+   : pip list
+=======================================
+GIT 연동
+https://github.com/kwanseok2110/master
+=======================================
+
+3. Windows EXE파일 생성
+ : pyinstaller --noconsole --onefile upbit.py
+ ==> ./dist/upbit.EXE 파일 생성됨

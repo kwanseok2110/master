@@ -1,0 +1,15 @@
+{
+    "enabled_tickers": [
+        "KRW-SAHARA"
+    ],
+    "investment_ratio": 50,
+    "strategy1": true,
+    "strategy2": true,
+    "strategy3": true,
+    "strategy4": false,
+    "strategy5": true,
+    "strategy6": true,
+    "strategy7": false,
+    "strategy8": false,
+    "is_unowned_buy_enabled": false
+}
