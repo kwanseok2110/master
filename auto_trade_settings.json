@@ -1,13 +1,13 @@
 {
     "enabled_tickers": [
-        "KRW-TOKAMAK"
+        "KRW-BTC"
     ],
     "investment_ratio": 50,
-    "strategy1": true,
+    "strategy1": false,
     "strategy2": true,
-    "strategy3": true,
-    "strategy4": false,
-    "strategy5": true,
+    "strategy3": false,
+    "strategy4": true,
+    "strategy5": false,
     "strategy6": true,
     "strategy7": false,
     "strategy8": false,

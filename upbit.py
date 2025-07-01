@@ -597,20 +597,20 @@ class UpbitChartApp(tk.Tk):
         last = df.iloc[-1]
         prev = df.iloc[-2]
         bb_period = 20
-        middle = df['close'].rolling(window=bb_period).mean().iloc[-1]
-        std = df['close'].rolling(window=bb_period).std().iloc[-1]
+        middle = df['close'].rolling(window=bb_period).mean()
+        std = df['close'].rolling(window=bb_period).std()
         upper = middle + (std * 2)
         lower = middle - (std * 2)
 
         # 매수: 종가가 볼린저밴드 하단 돌파 + 해머형 캔들
-        if last['close'] < lower and last['pattern'] == 'hammer':
+        if last['close'] < lower.iloc[-1] and last['pattern'] == 'hammer':
             self.execute_buy(ticker, "전략2: BB하단돌파+해머형")
             return
 
         # 매도: 종가가 볼린저밴드 상단 돌파 + shooting_star
         coin_info = self.balances_data.get(ticker)
         if coin_info and float(coin_info.get('balance', 0)) > 0:
-            if last['close'] > upper and last['pattern'] == 'shooting_star':
+            if last['close'] > upper.iloc[-1] and last['pattern'] == 'shooting_star':
                 self.execute_sell(ticker, coin_info, "전략2: BB상단돌파+슈팅스타")
 
     def run_strategy3(self):
@@ -719,13 +719,13 @@ class UpbitChartApp(tk.Tk):
         last = df.iloc[-1]
         prev = df.iloc[-2]
         # 매수: OBV가 직전 저점 돌파(상승 전환)
-        if prev['obv'] < prev['obv'] and last['obv'] > prev['obv']:
+        if df['obv'].iloc[-2] < df['obv'].iloc[-3] and df['obv'].iloc[-1] > df['obv'].iloc[-2]:
             self.execute_buy(ticker, "전략6: OBV 상승전환")
             return
         # 매도: OBV가 직전 고점 하락(하락 전환)
         coin_info = self.balances_data.get(ticker)
         if coin_info and float(coin_info.get('balance', 0)) > 0:
-            if prev['obv'] > prev['obv'] and last['obv'] < prev['obv']:
+            if df['obv'].iloc[-2] > df['obv'].iloc[-3] and df['obv'].iloc[-1] < df['obv'].iloc[-2]:
                 self.execute_sell(ticker, coin_info, "전략6: OBV 하락전환")
 
     def run_strategy7(self):
@@ -1295,6 +1295,7 @@ class UpbitChartApp(tk.Tk):
                  ylabel='Price (KRW)', addplot=trade_plots, datetime_format=dt_format, xrotation=20)
 
         all_lows, all_highs = self.master_df['low'], self.master_df['high']
+
         data_min, data_max = all_lows.min(), all_highs.max()
         padding = (data_max - data_min) * 0.1
         y_bound_min = max(0, data_min - padding)
@@ -1876,13 +1877,102 @@ class AutoTradeSettingsWindow(tk.Toplevel):
             'strategy2': tk.BooleanVar(),
             'strategy3': tk.BooleanVar(),
             'strategy4': tk.BooleanVar(),
-            'strategy5': tk.BooleanVar(),  # MA 골든/데드크로스
-            'strategy6': tk.BooleanVar(),  # OBV 추세전환
-            'strategy7': tk.BooleanVar(),  # StochRSI 돌파
-            'strategy8': tk.BooleanVar(),  # CCI 돌파
+            'strategy5': tk.BooleanVar(),
+            'strategy6': tk.BooleanVar(),
+            'strategy7': tk.BooleanVar(),
+            'strategy8': tk.BooleanVar(),
         }
         self.setup_widgets()
         self.load_settings()
+
+        # [추가] 종목 선택 시 전략 자동 분석 및 체크
+        self.vars['selected_ticker'].trace_add("write", self.on_ticker_selected)
+
+    def on_ticker_selected(self, *args):
+        display_name = self.vars['selected_ticker'].get()
+        ticker = self.master_app.display_name_to_ticker.get(display_name)
+        if not ticker:
+            return
+
+        try:
+            df_raw = pyupbit.get_ohlcv(ticker, interval='minute5', count=200)
+            if df_raw is None or len(df_raw) < 30:
+                return
+
+            # 기술적 지표 추가
+            df = self.master_app.get_technical_indicators_from_raw(df_raw)
+            if df is None or len(df) < 30:
+                return
+
+            close = df['close']
+            ma60 = close.rolling(window=60).mean()
+            ma20 = close.rolling(window=20).mean()
+            ma5 = close.rolling(window=5).mean()
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            # 모든 전략 체크 해제
+            for k in range(1, 9):
+                self.vars[f'strategy{k}'].set(False)
+
+            # 1. RSI+이동평균+거래량 (전략1) - 조건 완화
+            vol_ma10 = df['volume'].rolling(10).mean().iloc[-1]
+            if (last['rsi'] < 35 or last['ma5'] > last['ma20']) and last['volume'] > vol_ma10 * 1.5:
+                self.vars['strategy1'].set(True)
+
+            # 2. 볼린저밴드+캔들패턴 (전략2) - 조건 완화
+            bb_period = 20
+            middle = close.rolling(window=bb_period).mean()
+            std = close.rolling(window=bb_period).std()
+            lower = middle + (std * -2)
+            if last['close'] < lower.iloc[-1] * 1.05 or last.get('pattern', '') == 'hammer':
+                self.vars['strategy2'].set(True)
+
+            # 3. MACD+트레일링스탑 (전략3) - 최근 3봉 중 1봉이라도 돌파
+            macd_cross = any(
+                df['macd'].iloc[-i] > df['signal'].iloc[-i] and df['macd'].iloc[-i-1] < df['signal'].iloc[-i-1]
+                for i in range(1, 4)
+            )
+            if macd_cross:
+                self.vars['strategy3'].set(True)
+
+            # 4. 강한캔들+볼륨펌핑 (전략4) - 거래량 2배, 몸통 상위 30%
+            body_threshold = df['body'].quantile(0.7)
+            if last.get('is_green', False) and last['volume'] > prev['volume'] * 2 and last['body'] > body_threshold:
+                self.vars['strategy4'].set(True)
+
+            # 5. MA 골든/데드크로스 (전략5)
+            if prev['ma5'] < prev['ma20'] and last['ma5'] > last['ma20']:
+                self.execute_buy(ticker, "전략5: MA 골든크로스")
+                return
+            # 데드크로스 매도
+            coin_info = self.master_app.balances_data.get(ticker)
+            if coin_info and float(coin_info.get('balance', 0)) > 0:
+                if prev['ma5'] > prev['ma20'] and last['ma5'] < last['ma20']:
+                    self.execute_sell(ticker, coin_info, "전략5: MA 데드크로스")
+
+            # --- [추가] 차트 형태 및 전략 로그 출력 ---
+            # 1. 차트 형태 판별 (최근 20봉)
+            close20 = df['close'].iloc[-20:]
+            change_rate = (close20.iloc[-1] - close20.iloc[0]) / close20.iloc[0] * 100
+            if change_rate > 5:
+                chart_type = "상승 차트"
+            elif change_rate < -5:
+                chart_type = "하락 차트"
+            else:
+                chart_type = "횡보 차트"
+
+            # 2. 선택된 전략 목록
+            selected_strategies = []
+            for k in range(1, 9):
+                if self.vars[f'strategy{k}'].get():
+                    selected_strategies.append(f"전략{k}")
+
+            log_msg = f"{chart_type}입니다.\n차트 분석 결과 " + (", ".join(selected_strategies) + "가 선택되었습니다." if selected_strategies else "선택된 전략이 없습니다.")
+            self.master_app.log_auto_trade(log_msg)
+
+        except Exception as e:
+            print(e)
 
     def setup_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
@@ -1960,14 +2050,15 @@ class AutoTradeSettingsWindow(tk.Toplevel):
             ticker = self.master_app.display_name_to_ticker.get(selected_display)
             new['enabled_tickers'] = [ticker] if ticker else []
             new['investment_ratio'] = int(self.vars['investment_ratio'].get().replace('%', ''))
-            new['strategy1'] = self.vars['strategy1'].get()
-            new['strategy2'] = self.vars['strategy2'].get()
-            new['strategy3'] = self.vars['strategy3'].get()
-            new['strategy4'] = self.vars['strategy4'].get()
-            new['strategy5'] = self.vars['strategy5'].get()
-            new['strategy6'] = self.vars['strategy6'].get()
-            new['strategy7'] = self.vars['strategy7'].get()
-            new['strategy8'] = self.vars['strategy8'].get()
+            # 아래처럼 bool()로 감싸서 저장
+            new['strategy1'] = bool(self.vars['strategy1'].get())
+            new['strategy2'] = bool(self.vars['strategy2'].get())
+            new['strategy3'] = bool(self.vars['strategy3'].get())
+            new['strategy4'] = bool(self.vars['strategy4'].get())
+            new['strategy5'] = bool(self.vars['strategy5'].get())
+            new['strategy6'] = bool(self.vars['strategy6'].get())
+            new['strategy7'] = bool(self.vars['strategy7'].get())
+            new['strategy8'] = bool(self.vars['strategy8'].get())
             # 미보유 코인 전체 자동매수 옵션은 제거
             new['is_unowned_buy_enabled'] = False
 
@@ -1987,6 +2078,44 @@ class Tooltip:
         self.tooltip_window = None
         self.widget.bind("<Enter>", self.show_tooltip)
         self.widget.bind("<Leave>", self.hide_tooltip)
+
+    def show_tooltip(self, event):
+        if self.tooltip_window or not self.text:
+            return
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify='left',
+                      background="#ffffe0", relief='solid', borderwidth=1,
+                      font=("tahoma", "8", "normal"), wraplength=400)
+        label.pack(ipadx=1)
+
+    def hide_tooltip(self, event):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
+
+    def show_tooltip(self, event):
+        if self.tooltip_window or not self.text:
+            return
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify='left',
+                      background="#ffffe0", relief='solid', borderwidth=1,
+                      font=("tahoma", "8", "normal"), wraplength=400)
+        label.pack(ipadx=1)
+
+    def hide_tooltip(self, event):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
 
     def show_tooltip(self, event):
         if self.tooltip_window or not self.text:
