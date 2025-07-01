@@ -16,7 +16,21 @@
 GIT 연동
 https://github.com/kwanseok2110/master
 =======================================
-
-3. Windows EXE파일 생성
+4. Windows EXE파일 생성
  : pyinstaller --noconsole --onefile upbit.py
  ==> ./dist/upbit.EXE 파일 생성됨
+
+=======================================
+프로그램 실행하기 전 login 파일 생성하기
+=======================================
+1. Upbit에서 API 키 발급
+2. API키를 login.txt 파일로 (로컬)PC에 저장
+Ex) login.txt
+AB44OBsffKFusD8ZIFSb8ZIh499uxLACg9xbxgL7       //KEY 1
+F2xzF3j5li9KidRrlGCOKwCMy7g0tZyxwES70Hpx       //KEY 2
+1111 //자동매매 시작 시,, 비밀번호 (숫자 4자리)
+       
+
+
+
+
