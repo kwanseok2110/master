@@ -1,6 +1,6 @@
 {
     "enabled_tickers": [
-        "KRW-SAHARA"
+        "KRW-TOKAMAK"
     ],
     "investment_ratio": 50,
     "strategy1": true,

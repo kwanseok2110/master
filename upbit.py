@@ -788,86 +788,6 @@ class UpbitChartApp(tk.Tk):
             if prev['cci'] > -100 and last['cci'] <= -100:
                 self.execute_sell(ticker, coin_info, "전략8: CCI -100 하향돌파")
 
-    def check_sell_condition(self, ticker, coin_info):
-        s = self.auto_trade_settings
-        df = self.get_technical_indicators(ticker, interval='minute5', count=200)
-        if df is None or len(df) < 10:
-            return
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # 전략1: RSI 70 이상 & 5MA < 20MA
-        if s.get('strategy1'):
-            if last['rsi'] > 70 and last['ma5'] < last['ma20']:
-                self.execute_sell(ticker, coin_info, "전략1: RSI>70 & 5MA<20MA")
-
-        # 전략2: 볼린저밴드 상단 돌파 + 슈팅스타
-        if s.get('strategy2'):
-            bb_period = 20
-            middle = df['close'].rolling(window=bb_period).mean().iloc[-1]
-            std = df['close'].rolling(window=bb_period).std().iloc[-1]
-            upper = middle + (std * 2)
-            if last['close'] > upper and last['pattern'] == 'shooting_star':
-                self.execute_sell(ticker, coin_info, "전략2: BB상단돌파+슈팅스타")
-
-        # 전략3: MACD 시그널 하향돌파 or 트레일링스탑(최고가 대비 -3% 하락)
-        if s.get('strategy3'):
-            buy_price = float(coin_info.get('avg_buy_price', 0))
-            max_high = df['high'].iloc[-20:].max()
-            cur_price = last['close']
-            if prev['macd'] > prev['signal'] and last['macd'] < last['signal']:
-                self.execute_sell(ticker, coin_info, "전략3: MACD하향돌파")
-            elif buy_price > 0 and cur_price < max_high * 0.97:
-                self.execute_sell(ticker, coin_info, "전략3: 트레일링스탑 -3%")
-
-        # 전략4: 음봉 + 거래량 급증
-        if s.get('strategy4'):
-            if not last['is_green'] and last['volume'] > prev['volume'] * 2:
-                self.execute_sell(ticker, coin_info, "전략4: 강한음봉+볼륨급증")
-
-        # 전략5: MA 데드크로스
-        if s.get('strategy5'):
-            if prev['ma5'] > prev['ma20'] and last['ma5'] < last['ma20']:
-                self.execute_sell(ticker, coin_info, "전략5: MA 데드크로스")
-
-        # 전략6: OBV 하락전환
-        if s.get('strategy6'):
-            # OBV 계산 (없으면 추가)
-            if 'obv' not in df.columns:
-                obv = [0]
-                for i in range(1, len(df)):
-                    if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                        obv.append(obv[-1] + df['volume'].iloc[i])
-                    elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                        obv.append(obv[-1] - df['volume'].iloc[i])
-                    else:
-                        obv.append(obv[-1])
-                df['obv'] = obv
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-            if prev['obv'] > last['obv']:
-                self.execute_sell(ticker, coin_info, "전략6: OBV 하락전환")
-
-        # 전략7: StochRSI 0.8 이상에서 하향 돌파
-        if s.get('strategy7'):
-            rsi = df['rsi']
-            min_rsi = rsi.rolling(window=14, min_periods=1).min()
-            max_rsi = rsi.rolling(window=14, min_periods=1).max()
-            stochrsi = (rsi - min_rsi) / (max_rsi - min_rsi)
-            df['stochrsi'] = stochrsi
-            if prev['stochrsi'] > 0.8 and last['stochrsi'] <= 0.8:
-                self.execute_sell(ticker, coin_info, "전략7: StochRSI 하향돌파")
-
-        # 전략8: CCI -100 돌파
-        if s.get('strategy8'):
-            tp = (df['high'] + df['low'] + df['close']) / 3
-            ma = tp.rolling(window=20, min_periods=1).mean()
-            md = tp.rolling(window=20, min_periods=1).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
-            cci = (tp - ma) / (0.015 * md)
-            df['cci'] = cci
-            if prev['cci'] > -100 and last['cci'] <= -100:
-                self.execute_sell(ticker, coin_info, "전략8: CCI -100 하향돌파")
-
     def execute_sell(self, ticker, coin_info, reason):
         self.log_auto_trade(f"📉 [{reason}] {ticker} 매도 신호 포착")
         balance = float(coin_info['balance'])
@@ -921,6 +841,9 @@ class UpbitChartApp(tk.Tk):
             result = upbit.buy_market_order(ticker, buy_amount)
             # 업비트 수수료율(시장가 0.05%) 적용
             fee = buy_amount * 0.0005
+            # --- [추가] 매수 전략명을 저장 ---
+            self.last_buy_strategy = {} if not hasattr(self, 'last_buy_strategy') else self.last_buy_strategy
+            self.last_buy_strategy[ticker] = reason.split(":")[0].strip()  # 예: "전략1"
             self.log_auto_trade(
                 f"✅ {ticker} {buy_amount:,.0f} KRW 만큼 매수 주문 완료. (주문결과: {result})",
                 log_dict={
@@ -941,7 +864,52 @@ class UpbitChartApp(tk.Tk):
             self.last_sell_time[ticker] = datetime.now()
         except Exception as e:
             self.log_auto_trade(f"❗️ {ticker} 매수 주문 실행 중 오류: {e}")
-    
+
+    def check_sell_condition(self, ticker, coin_info):
+        s = self.auto_trade_settings
+        df = self.get_technical_indicators(ticker, interval='minute5', count=200)
+        if df is None or len(df) < 10:
+            return
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # --- [변경] 매수 전략에 따라 매도 조건만 적용 ---
+        strategy_map = {
+            "전략1": lambda: last['rsi'] > 70 and last['ma5'] < last['ma20'],
+            "전략2": lambda: (
+                last['close'] > last['close'].rolling(20).mean().iloc[-1] + (last['close'].rolling(20).std().iloc[-1] * 2)
+                and last['pattern'] == 'shooting_star'
+            ),
+            "전략3": lambda: (
+                (prev['macd'] > prev['signal'] and last['macd'] < last['signal']) or
+                (float(coin_info.get('avg_buy_price', 0)) > 0 and last['close'] < df['high'].iloc[-20:].max() * 0.97)
+            ),
+            "전략4": lambda: (not last['is_green'] and last['volume'] > prev['volume'] * 2),
+            "전략5": lambda: (prev['ma5'] > prev['ma20'] and last['ma5'] < last['ma20']),
+            "전략6": lambda: (
+                'obv' in df.columns and prev['obv'] > last['obv']
+            ),
+            "전략7": lambda: (
+                (last['rsi'] - last['rsi'].rolling(14, min_periods=1).min().iloc[-1]) /
+                (last['rsi'].rolling(14, min_periods=1).max().iloc[-1] - last['rsi'].rolling(14, min_periods=1).min().iloc[-1]) <= 0.8
+                if last['rsi'].rolling(14, min_periods=1).max().iloc[-1] != last['rsi'].rolling(14, min_periods=1).min().iloc[-1] else False
+            ),
+            "전략8": lambda: (
+                ((last['high'] + last['low'] + last['close']) / 3 - ((last['high'] + last['low'] + last['close']) / 3).rolling(20, min_periods=1).mean().iloc[-1]) /
+                (0.015 * ((last['high'] + last['low'] + last['close']) / 3).rolling(20, min_periods=1).apply(lambda x: np.mean(np.abs(x - np.mean(x)))).iloc[-1]) <= -100
+                if ((last['high'] + last['low'] + last['close']) / 3).rolling(20, min_periods=1).apply(lambda x: np.mean(np.abs(x - np.mean(x)))).iloc[-1] != 0 else False
+            ),
+        }
+
+        # 매수 시 사용한 전략만 매도 조건 적용
+        buy_strategy = getattr(self, 'last_buy_strategy', {}).get(ticker)
+        if not buy_strategy:
+            return
+
+        if buy_strategy in strategy_map and strategy_map[buy_strategy]():
+            self.execute_sell(ticker, coin_info, f"{buy_strategy}: 매도조건")
+
+
     def create_buy_sell_tab(self, parent_frame, side):
         is_buy = (side == "buy")
         order_type_var = self.buy_order_type if is_buy else self.sell_order_type
@@ -2141,9 +2109,6 @@ class AutoTradeMonitorWindow(tk.Toplevel):
             pass
         self.destroy()
 
-# -----------------------------------------------------------------------------
-# 3. 프로그램 실행
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app = UpbitChartApp()
     app.start_updates()
