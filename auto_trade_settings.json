@@ -1,6 +1,6 @@
 {
     "enabled_tickers": [
-        "KRW-XRP"
+        "KRW-BTC"
     ],
     "investment_amount": 5000,
     "max_additional_buys": 5
