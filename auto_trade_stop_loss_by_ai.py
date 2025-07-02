@@ -143,7 +143,9 @@ class UpbitChartApp(tk.Tk):
             print("ℹ️ 자동매매 설정 파일 없음. 기본값으로 시작합니다.")
             self.auto_trade_settings = {
                 'enabled_tickers': [], 
-                'total_investment_limit': 100000,
+                'total_investment_limit': 10000000,
+                'trend_investment_ratio': 0.25,
+                'sideways_investment_ratio': 0.15
             }
             self.save_auto_trade_settings()
 
@@ -335,7 +337,7 @@ class UpbitChartApp(tk.Tk):
         if ma5 < ma20 < ma60 and ma20_slope < 0: return '하락장'
         return '횡보장'
 
-    def _check_obv_divergence(self, df, period=60): # [수정] period를 30에서 60으로 변경
+    def _check_obv_divergence(self, df, period=60):
         if df is None or len(df) < period:
             return None, None
         
@@ -356,18 +358,26 @@ class UpbitChartApp(tk.Tk):
         trade_states = {}
         SIDEWAYS_MAX_BUY_COUNT = 3
         TREND_MAX_BUY_COUNT = 5
-        MIN_HOLD_CANDLES = 3 # 최소 3개 캔들(3분)은 보유하는 규칙
+        MIN_HOLD_CANDLES = 3
 
         while self.is_running and self.is_auto_trading:
             try:
+                trend_ratio = self.auto_trade_settings.get('trend_investment_ratio', 0.25)
+                sideways_ratio = self.auto_trade_settings.get('sideways_investment_ratio', 0.15)
+
+                current_krw_balance = upbit.get_balance("KRW")
+                if current_krw_balance is None:
+                    self.log_auto_trade("⚠️ KRW 잔액 조회 실패. 다음 루프에서 재시도합니다.")
+                    time.sleep(10)
+                    continue
+                
+                investment_limit_from_settings = self.auto_trade_settings.get('total_investment_limit', float('inf'))
+                effective_total_investment = min(current_krw_balance, investment_limit_from_settings)
+                
                 enabled_tickers = self.auto_trade_settings.get('enabled_tickers', [])
                 if not enabled_tickers:
                     time.sleep(30)
                     continue
-
-                total_investment_limit = self.auto_trade_settings.get('total_investment_limit', 5000)
-                trend_buy_amount_per_trade = total_investment_limit / TREND_MAX_BUY_COUNT
-                sideways_buy_amount_per_trade = total_investment_limit / TREND_MAX_BUY_COUNT
 
                 for ticker in enabled_tickers:
                     if not self.is_running or not self.is_auto_trading: break
@@ -375,7 +385,7 @@ class UpbitChartApp(tk.Tk):
                     if ticker not in trade_states:
                         trade_states[ticker] = {'has_coin': False, 'buy_price': 0, 'buy_amount': 0, 'buy_count': 0, 
                                                 'last_logged_profit_rate': 0, 'last_logged_market_state': '', 'strategy': None,
-                                                'buy_time': None, 'buy_candle_count': 0}
+                                                'buy_time': None, 'buy_candle_count': 0, 'max_profit_rate': 0.0}
 
                     df = self.get_technical_indicators(ticker, interval='minute1', count=200)
                     if df is None: time.sleep(1); continue
@@ -384,6 +394,11 @@ class UpbitChartApp(tk.Tk):
                     if current_price is None: time.sleep(1); continue
                     
                     market_state = self.get_market_state(df)
+                    
+                    trend_total_investment = effective_total_investment * trend_ratio
+                    sideways_total_investment = effective_total_investment * sideways_ratio
+                    trend_buy_amount_per_trade = trend_total_investment / TREND_MAX_BUY_COUNT
+                    sideways_buy_amount_per_trade = sideways_total_investment / SIDEWAYS_MAX_BUY_COUNT
 
                     balance = upbit.get_balance(ticker)
                     state = trade_states[ticker]
@@ -395,10 +410,9 @@ class UpbitChartApp(tk.Tk):
                         
                         if state.get('strategy') is None:
                             self.log_auto_trade(f"ℹ️ [{ticker}] 기존 보유 포지션 발견. 현재 시장 상태 분석...")
-                            
                             state['buy_time'] = datetime.now() 
                             state['buy_candle_count'] = 0
-
+                            state['max_profit_rate'] = 0.0
                             if market_state == '횡보장':
                                 state['strategy'] = 'sideways_1p'
                                 if state['buy_count'] == 0: state['buy_count'] = 1
@@ -410,18 +424,18 @@ class UpbitChartApp(tk.Tk):
                         else:
                              if state['buy_time']:
                                 state['buy_candle_count'] = (datetime.now() - state['buy_time']).total_seconds() / 60
-
                     else:
                         state['buy_count'] = 0
                         state['strategy'] = None
                         state['buy_time'] = None
                         state['buy_candle_count'] = 0
+                        state['max_profit_rate'] = 0.0
+
 
                     last_rsi = df['rsi'].iloc[-1]
                     last_ma5 = df['ma5'].iloc[-1]
                     last_ma20 = df['ma20'].iloc[-1]
 
-                    # --- 보유 코인 처리 로직 (매도 및 물타기) ---
                     if state['has_coin']:
                         profit_rate = (current_price - state['buy_price']) / state['buy_price'] * 100
 
@@ -429,13 +443,13 @@ class UpbitChartApp(tk.Tk):
                             sell_type = "익절" if profit_rate >= 0 else "손절"
                             self.log_auto_trade(f"💰 SELL [{ticker}][{sell_type}] | 사유: {reason}, 수익률: {profit_rate:+.2f}%")
                             upbit.sell_market_order(ticker, state['buy_amount'])
+                            state['max_profit_rate'] = 0.0 # 매도 후 최고 수익률 초기화
                             time.sleep(5)
                         
                         if state['buy_candle_count'] < MIN_HOLD_CANDLES:
                             time.sleep(1) 
                             continue
 
-                        # 횡보장 전략의 매도 및 물타기 로직
                         if state.get('strategy') == 'sideways_1p':
                             sell_reason = None
                             if profit_rate >= 1.0:
@@ -456,35 +470,38 @@ class UpbitChartApp(tk.Tk):
 
                             if can_buy_more and is_loss_for_add_buy and is_still_sideways and is_oversold:
                                 log_icon = "💧"
-                                self.log_auto_trade(f"{log_icon} BUY [{ticker}][횡보장 물타기 {state['buy_count'] + 1}/{SIDEWAYS_MAX_BUY_COUNT}] | 수익률: {profit_rate:+.2f}%, RSI: {last_rsi:.2f}")
+                                self.log_auto_trade(f"{log_icon} BUY [{ticker}][횡보장 물타기] | 수익률: {profit_rate:+.2f}%, RSI: {last_rsi:.2f} | 주문액: {sideways_buy_amount_per_trade:,.0f}원")
                                 try:
                                     result = upbit.buy_market_order(ticker, sideways_buy_amount_per_trade)
                                     if result and 'uuid' in result:
                                         state['buy_count'] += 1
+                                        state['max_profit_rate'] = 0.0
                                         self.log_auto_trade(f"✅ [물타기] 성공 (총 {state['buy_count']}회)")
                                         time.sleep(5)
                                         continue
                                 except Exception as buy_error:
                                     self.log_auto_trade(f"⚠️ [물타기] 주문 실패: {buy_error}")
 
-                        # 추세추종 전략의 매도 및 추가매수 로직
                         elif state.get('strategy') == 'trend_follow':
-                            if abs(profit_rate - state['last_logged_profit_rate']) >= 0.1 or market_state != state['last_logged_market_state']:
+                            if profit_rate > state.get('max_profit_rate', 0.0):
+                                state['max_profit_rate'] = profit_rate
+
+                            if abs(profit_rate - state['last_logged_profit_rate']) >= 1.0 or market_state != state['last_logged_market_state']:
                                 self.log_auto_trade(f"🔎 [{ticker}] 상태 변경 | 평단가: {state['buy_price']:,.2f} | 수익률: {profit_rate:+.2f}% | 시장: {market_state}")
                                 state['last_logged_profit_rate'] = profit_rate
                                 state['last_logged_market_state'] = market_state
                             
                             sell_signal, reason = False, ""
                             
-                            # 상승장에서는 OBV 다이버전스 매도 신호를 사용하지 않음 (주석 처리)
-                            # obv_div_type, obv_div_reason = self._check_obv_divergence(df)
-                            # if obv_div_type == "Bearish" and last_rsi > 68: 
-                            #     sell_signal, reason = True, obv_div_reason
-                            
                             if profit_rate <= -5.0:
                                 self.log_auto_trade(f"🚨 SELL [{ticker}][손절] | 사유: 강제 손절 라인(-5%) 도달, 수익률: {profit_rate:.2f}%")
                                 upbit.sell_market_order(ticker, state['buy_amount'])
+                                state['max_profit_rate'] = 0.0
                                 time.sleep(5); continue
+                            
+                            elif state['max_profit_rate'] >= 8.0 and profit_rate < state['max_profit_rate'] - 3.0:
+                                sell_signal = True
+                                reason = f"이동 익절 (최고 수익 {state['max_profit_rate']:.2f}% 대비 3% 하락)"
                             
                             elif market_state == '상승장' and last_ma5 < last_ma20 and df['ma5'].iloc[-2] >= df['ma20'].iloc[-2]:
                                 sell_signal, reason = True, "상승장 데드크로스 (추세 종료)"
@@ -509,21 +526,26 @@ class UpbitChartApp(tk.Tk):
                                     if is_dip and is_not_overbought: buy_reason = "불타기"
                                 if buy_reason:
                                     log_icon = "💧" if buy_reason == "물타기" else "🔥"
-                                    self.log_auto_trade(f"{log_icon} BUY [{ticker}][{buy_reason} 시도 {state['buy_count'] + 1}/{TREND_MAX_BUY_COUNT}] | 수익률: {profit_rate:+.2f}%, RSI: {last_rsi:.2f}")
+                                    self.log_auto_trade(f"{log_icon} BUY [{ticker}][{buy_reason} 시도] | 수익률: {profit_rate:+.2f}%, RSI: {last_rsi:.2f} | 주문액: {trend_buy_amount_per_trade:,.0f}원")
                                     try:
                                         result = upbit.buy_market_order(ticker, trend_buy_amount_per_trade)
                                         if result and 'uuid' in result:
-                                            state['buy_count'] += 1; self.log_auto_trade(f"✅ [{buy_reason}] 성공 (총 {state['buy_count']}회)"); time.sleep(5); continue
+                                            state['buy_count'] += 1
+                                            state['max_profit_rate'] = 0.0
+                                            self.log_auto_trade(f"✅ [{buy_reason}] 성공 (총 {state['buy_count']}회)"); time.sleep(5); continue
                                     except Exception as buy_error: pass
 
-                    # --- 신규 매수 로직 ---
                     else: # 코인 미보유
                         if market_state != state['last_logged_market_state']:
                             self.log_auto_trade(f"⏳ [{ticker}] 신규매수 기회탐색 | 시장: {market_state} | RSI: {last_rsi:.2f}")
                             state['last_logged_market_state'] = market_state
                         
                         def buy_coin(strategy, amount, reason):
-                            self.log_auto_trade(f"📈 BUY [{ticker}][{reason}]")
+                            if amount < 5000:
+                                self.log_auto_trade(f"⚠️ 주문 건너뜀 | 계산된 주문액({amount:,.0f}원)이 최소주문액(5,000원) 미만입니다.")
+                                return False
+                                
+                            self.log_auto_trade(f"📈 BUY [{ticker}][{reason}] | 주문액: {amount:,.0f}원")
                             try:
                                 result = upbit.buy_market_order(ticker, amount)
                                 if result and 'uuid' in result:
@@ -531,6 +553,7 @@ class UpbitChartApp(tk.Tk):
                                     state['buy_count'] = 1
                                     state['buy_time'] = datetime.now()
                                     state['buy_candle_count'] = 0
+                                    state['max_profit_rate'] = 0.0
                                     time.sleep(5)
                                     return True
                             except Exception as e:
@@ -538,7 +561,7 @@ class UpbitChartApp(tk.Tk):
                             return False
 
                         if market_state == '횡보장' and 'bb_lower' in df.columns and current_price <= df['bb_lower'].iloc[-1] and last_rsi < 40 and state['buy_count'] == 0:
-                            if buy_coin('sideways_1p', sideways_buy_amount_per_trade, "횡보장 1차 매수 | 사유: BB하단 터치 및 RSI 과매도"):
+                            if buy_coin('sideways_1p', sideways_buy_amount_per_trade, "횡보장 1차 매수"):
                                 continue
                         
                         else:
@@ -556,7 +579,7 @@ class UpbitChartApp(tk.Tk):
                                     buy_signal, reason = True, "횡보장 BB하단 및 RSI 과매도"
                             
                             if buy_signal:
-                                if buy_coin('trend_follow', trend_buy_amount_per_trade, f"신규매수 1/{TREND_MAX_BUY_COUNT} | 사유: {reason}"):
+                                if buy_coin('trend_follow', trend_buy_amount_per_trade, f"신규매수 | 사유: {reason}"):
                                     continue
                     time.sleep(2)
                 time.sleep(15)
@@ -566,7 +589,6 @@ class UpbitChartApp(tk.Tk):
                 self.log_auto_trade(traceback.format_exc())
                 time.sleep(60)
         self.log_auto_trade("🤖 다중 종목 자동매매 로직 종료.")
-
 
     def get_technical_indicators(self, ticker, interval='day', count=200):
         try:
@@ -1434,10 +1456,13 @@ class AutoTradeSettingsWindow(tk.Toplevel):
         super().__init__(master)
         self.master_app = master
         self.title("자동매매 설정")
-        self.geometry("400x380")
+        self.geometry("420x450")
         self.resizable(False, False)
+        
         self.vars = {
-            'total_investment_limit': tk.StringVar()
+            'total_investment_limit': tk.StringVar(),
+            'trend_ratio': tk.StringVar(),
+            'sideways_ratio': tk.StringVar()
         }
         self.setup_widgets()
         self.load_settings()
@@ -1451,13 +1476,6 @@ class AutoTradeSettingsWindow(tk.Toplevel):
         ttk.Button(button_frame, text="저장", command=self.save_and_close).pack(side=tk.RIGHT, padx=5)
         ttk.Button(button_frame, text="닫기", command=self.destroy).pack(side=tk.RIGHT)
         
-        options_frame = ttk.LabelFrame(main_frame, text="[2] 투자 설정", padding=10)
-        options_frame.pack(side="bottom", fill=tk.X, pady=5)
-        ttk.Label(options_frame, text="총 투자 한도 (원):").pack(side=tk.LEFT, padx=5)
-        self.amount_entry = ttk.Entry(options_frame, textvariable=self.vars['total_investment_limit'], width=15)
-        self.amount_entry.pack(side=tk.LEFT)
-        ttk.Label(options_frame, text="(설정 금액을 분할 매수)", foreground="gray").pack(side=tk.LEFT, padx=5)
-        
         tickers_frame = ttk.LabelFrame(main_frame, text="[1] 자동매매 대상 종목 (거래대금 상위 10개, 단일 선택)", padding=10)
         tickers_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         list_frame = ttk.Frame(tickers_frame)
@@ -1469,6 +1487,26 @@ class AutoTradeSettingsWindow(tk.Toplevel):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         refresh_button = ttk.Button(tickers_frame, text="목록 새로고침", command=self.populate_top_tickers)
         refresh_button.pack(pady=(5,0), fill='x')
+
+        ratio_frame = ttk.LabelFrame(main_frame, text="[2] 시장 상황별 투자 비중 (켈리 공식 단순화)", padding=10)
+        ratio_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(ratio_frame, text="상승장 투자 비중 (%):").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.trend_ratio_entry = ttk.Entry(ratio_frame, textvariable=self.vars['trend_ratio'], width=10)
+        self.trend_ratio_entry.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+        ttk.Label(ratio_frame, text="(총 자산의 N%를 상승장 투자에 할당)").grid(row=0, column=2, sticky='w', padx=5, pady=2)
+
+        ttk.Label(ratio_frame, text="횡보장 투자 비중 (%):").grid(row=1, column=0, sticky='w', padx=5, pady=2)
+        self.sideways_ratio_entry = ttk.Entry(ratio_frame, textvariable=self.vars['sideways_ratio'], width=10)
+        self.sideways_ratio_entry.grid(row=1, column=1, sticky='w', padx=5, pady=2)
+        ttk.Label(ratio_frame, text="(총 자산의 N%를 횡보장 투자에 할당)").grid(row=1, column=2, sticky='w', padx=5, pady=2)
+
+        limit_frame = ttk.LabelFrame(main_frame, text="[3] 총 투자 한도 (안전장치)", padding=10)
+        limit_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(limit_frame, text="최대 투자 한도 (원):").pack(side=tk.LEFT, padx=5)
+        self.amount_entry = ttk.Entry(limit_frame, textvariable=self.vars['total_investment_limit'], width=15)
+        self.amount_entry.pack(side=tk.LEFT)
+        ttk.Label(limit_frame, text="(잔액이 이 금액을 초과해도, 이 금액까지만 투자)", foreground="gray").pack(side=tk.LEFT, padx=5)
 
     def populate_top_tickers(self):
         threading.Thread(target=self._populate_worker, daemon=True).start()
@@ -1504,7 +1542,13 @@ class AutoTradeSettingsWindow(tk.Toplevel):
 
     def load_settings(self):
         s = self.master_app.auto_trade_settings
-        self.vars['total_investment_limit'].set(str(s.get('total_investment_limit', 100000)))
+        self.vars['total_investment_limit'].set(str(s.get('total_investment_limit', 10000000)))
+        
+        trend_ratio = s.get('trend_investment_ratio', 0.25)
+        sideways_ratio = s.get('sideways_investment_ratio', 0.15)
+        self.vars['trend_ratio'].set(f"{trend_ratio * 100:g}")
+        self.vars['sideways_ratio'].set(f"{sideways_ratio * 100:g}")
+
         self.populate_top_tickers()
 
     def restore_selection(self):
@@ -1521,7 +1565,7 @@ class AutoTradeSettingsWindow(tk.Toplevel):
 
     def save_and_close(self):
         try:
-            new_settings = {}
+            new_settings = self.master_app.auto_trade_settings.copy()
             selected_ticker_for_chart = None
             
             selected_indices = self.ticker_listbox.curselection()
@@ -1534,9 +1578,19 @@ class AutoTradeSettingsWindow(tk.Toplevel):
                     selected_ticker_for_chart = ticker
             new_settings['enabled_tickers'] = enabled_tickers
             
+            trend_pct = float(self.vars['trend_ratio'].get())
+            sideways_pct = float(self.vars['sideways_ratio'].get())
+
+            if not (0 < trend_pct <= 100 and 0 < sideways_pct <= 100):
+                messagebox.showwarning("입력 오류", "투자 비중은 0보다 크고 100 이하인 숫자여야 합니다.", parent=self)
+                return
+            
+            new_settings['trend_investment_ratio'] = trend_pct / 100
+            new_settings['sideways_investment_ratio'] = sideways_pct / 100
+
             amount = int(self.vars['total_investment_limit'].get())
             if amount < 25000:
-                messagebox.showwarning("금액 확인", "최소 투자 한도는 25,000원입니다 (최소주문 5,000원 * 5회 분할).", parent=self)
+                messagebox.showwarning("금액 확인", "최소 투자 한도는 25,000원입니다.", parent=self)
                 return
             new_settings['total_investment_limit'] = amount
             
@@ -1549,7 +1603,7 @@ class AutoTradeSettingsWindow(tk.Toplevel):
             messagebox.showinfo("저장 완료", "자동매매 설정이 저장되었습니다.", parent=self)
             self.destroy()
         except ValueError:
-            messagebox.showerror("입력 오류", "총 투자 한도는 숫자로 입력해야 합니다.", parent=self)
+            messagebox.showerror("입력 오류", "투자 비중과 한도는 숫자로 입력해야 합니다.", parent=self)
         except Exception as e:
             messagebox.showerror("오류", f"설정 저장 중 오류가 발생했습니다: {e}", parent=self)
 
