@@ -97,7 +97,6 @@ class UpbitChartApp(tk.Tk):
         self._keep_view = False
         self.current_chart_ticker = None
         self._ignore_market_select_event = False
-        self.data_bounds = {'x': None, 'y': None}
         self.data_queue = Queue()
 
         self.ma_vars = {'5': tk.BooleanVar(value=True), '20': tk.BooleanVar(value=True), '60': tk.BooleanVar(), '120': tk.BooleanVar()}
@@ -492,31 +491,46 @@ class UpbitChartApp(tk.Tk):
 
     def get_technical_indicators_from_raw(self, df, min_length=20):
         if df is None or len(df) < min_length: return None
+        df = df.copy() 
+
         for p in [5, 20, 60, 120]: df[f'ma{p}'] = df['close'].rolling(window=p, min_periods=1).mean()
-        delta = df['close'].diff(1); gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
-        rs = gain / loss.replace(0, 1e-9); df['rsi'] = 100 - (100 / (1 + rs))
-        df['ema12'] = df['close'].ewm(span=12, adjust=False, min_periods=1).mean()
-        df['ema26'] = df['close'].ewm(span=26, adjust=False, min_periods=1).mean()
-        df['macd'] = df['ema12'] - df['ema26']; df['signal'] = df['macd'].ewm(span=9, adjust=False, min_periods=1).mean()
+        
+        delta = df['close'].diff(1); gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = df['ema12'] - df['ema26']; df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        
         df['bb_middle'] = df['close'].rolling(window=20).mean()
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
         df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+        
         obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
         df['obv'] = obv
-        df['obv_ema'] = df['obv'].ewm(com=20, min_periods=1).mean()
+        df['obv_ema'] = df['obv'].ewm(com=20).mean()
+        
         typical_price = (df['high'] + df['low'] + df['close']) / 3
         money_flow = typical_price * df['volume']
-        mf_positive = np.where(df['close'] > df['close'].shift(1), money_flow, 0)
-        mf_negative = np.where(df['close'] < df['close'].shift(1), money_flow, 0)
-        mf_avg_gain = pd.Series(mf_positive).rolling(14, min_periods=1).sum()
-        mf_avg_loss = pd.Series(mf_negative).rolling(14, min_periods=1).sum()
-        # [수정] FutureWarning 해결
-        mfi_ratio = mf_avg_gain / mf_avg_loss.replace(0, 1e-9)
-        df['mfi'] = 100 - (100 / (1 + mfi_ratio))
-        df['mfi'] = df['mfi'].fillna(50)
         
+        positive_flow_values = [money_flow.iloc[i] if typical_price.iloc[i] > typical_price.iloc[i-1] else 0 for i in range(1, len(typical_price))]
+        negative_flow_values = [money_flow.iloc[i] if typical_price.iloc[i] < typical_price.iloc[i-1] else 0 for i in range(1, len(typical_price))]
+
+        positive_flow = pd.Series(positive_flow_values, index=typical_price.index[1:])
+        negative_flow = pd.Series(negative_flow_values, index=typical_price.index[1:])
+        
+        positive_mf_14 = positive_flow.rolling(14).sum()
+        negative_mf_14 = negative_flow.rolling(14).sum()
+
+        money_ratio = positive_mf_14 / negative_mf_14
+        money_ratio = money_ratio.replace([np.inf, -np.inf], 0)
+
+        df['mfi'] = 100 - (100 / (1 + money_ratio))
+        df['mfi'] = df['mfi'].fillna(50)
+
         df['volume_ma20'] = df['volume'].rolling(window=20, min_periods=1).mean()
         return df
         
@@ -564,7 +578,7 @@ class UpbitChartApp(tk.Tk):
             traceback.print_exc()
 
     def _redraw_chart(self):
-        self.fig.clear()
+        self.fig.clear() 
         if self.master_df is None or self.master_df.empty:
             ax = self.fig.add_subplot(111)
             ax.text(0.5, 0.5, "차트 데이터가 없습니다.", ha='center', va='center')
@@ -572,7 +586,6 @@ class UpbitChartApp(tk.Tk):
             return
 
         df = self.master_df.copy()
-        # [수정] x축 데이터로 사용할 숫자 인덱스 생성
         x_indices = np.arange(len(df))
 
         gs = self.fig.add_gridspec(4, 1, height_ratios=[4, 1, 1, 1], hspace=0.05)
@@ -585,44 +598,39 @@ class UpbitChartApp(tk.Tk):
         plt.setp(ax2.get_xticklabels(), visible=False)
         plt.setp(ax3.get_xticklabels(), visible=False)
         
-        # 1. 메인 캔들 차트 그리기
         mpf.plot(df, type='candle', ax=ax1, style='yahoo')
 
-        # 이동평균선 그리기
         for period, var in self.ma_vars.items():
             if var.get() and f'ma{period}' in df.columns:
-                # [수정] x축을 숫자 인덱스로 전달
                 ax1.plot(x_indices, df[f'ma{period}'], label=f'MA{period}', lw=0.8)
 
-        # 볼린저밴드 그리기
         if self.bb_var.get() and 'bb_upper' in df.columns:
             ax1.plot(x_indices, df['bb_middle'], color='orange', linestyle=':', lw=1, label='BB Center')
-            # [수정] x축을 숫자 인덱스로 전달
             ax1.fill_between(x_indices, df['bb_lower'], df['bb_upper'], color='gray', alpha=0.1)
 
         ax1.set_ylabel('Price (KRW)')
         ax1.set_title(self.get_chart_title())
         ax1.legend(loc='upper left', fontsize='small')
         ax1.grid(True, linestyle=':', alpha=0.6)
+        ax1.yaxis.set_label_position("right")
+        ax1.yaxis.tick_right()
 
-        # 2. 거래량 차트 그리기
         colors = ['red' if c >= o else 'blue' for c, o in zip(df['close'], df['open'])]
-        # [수정] x축을 숫자 인덱스로 전달
         ax2.bar(x_indices, df['volume'], color=colors, alpha=0.7, width=0.8)
         ax2.plot(x_indices, df['volume_ma20'], 'm--', lw=1, label='Vol MA20')
         ax2.set_ylabel('Volume')
         ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',')))
+        ax2.yaxis.set_label_position("right")
+        ax2.yaxis.tick_right()
 
-        # 3. OBV 차트 그리기
-        # [수정] x축을 숫자 인덱스로 전달
         ax3.plot(x_indices, df['obv'], 'g-', lw=1, label='OBV')
         ax3.plot(x_indices, df['obv_ema'], 'r--', lw=1, label='OBV Signal')
         ax3.set_ylabel('OBV')
         ax3.legend(loc='upper left', fontsize='small')
         ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',')))
+        ax3.yaxis.set_label_position("right")
+        ax3.yaxis.tick_right()
 
-        # 4. MFI 차트 그리기
-        # [수정] x축을 숫자 인덱스로 전달
         ax4.plot(x_indices, df['mfi'], 'b-', lw=1, label='MFI')
         ax4.axhline(80, color='r', linestyle=':', lw=1)
         ax4.axhline(20, color='g', linestyle=':', lw=1)
@@ -630,14 +638,14 @@ class UpbitChartApp(tk.Tk):
         ax4.fill_between(x_indices, 0, 20, color='g', alpha=0.1)
         ax4.set_ylabel('MFI')
         ax4.set_ylim(0, 100)
+        ax4.yaxis.set_label_position("right")
+        ax4.yaxis.tick_right()
         
-        # [수정] X축 눈금과 라벨을 올바르게 설정하는 로직
-        tick_indices = np.linspace(0, len(df) - 1, 5, dtype=int) # 5개의 눈금 위치 계산
+        tick_indices = np.linspace(0, len(df) - 1, 5, dtype=int)
         tick_labels = [df.index[i].strftime('%m-%d %H:%M' if self.selected_interval.get() not in ['day', 'week'] else '%Y-%m-%d') for i in tick_indices]
         ax4.set_xticks(tick_indices)
         ax4.set_xticklabels(tick_labels, rotation=10, ha='right')
 
-        # 가격 및 평단가 라인 추가
         blended_transform = plt.matplotlib.transforms.blended_transform_factory(ax1.transAxes, ax1.transData)
         if self.current_price > 0:
             ax1.axhline(y=self.current_price, color='red', linestyle='--', linewidth=0.9)
@@ -655,12 +663,10 @@ class UpbitChartApp(tk.Tk):
                 ax1.axhline(y=avg_buy_price, color='blue', linestyle=':', linewidth=0.9)
                 ax1.text(1.01, avg_buy_price, f' {avg_buy_price:,.2f} ', transform=blended_transform, color='white', backgroundcolor='blue', va='center', ha='left')
         
-        self.fig.subplots_adjust(left=0.08, right=0.88, bottom=0.1, top=0.92, hspace=0.1)
+        self.fig.subplots_adjust(left=0.08, right=0.88, bottom=0.1, top=0.92)
         
         self.canvas.draw()
 
-    # 이하 코드는 모두 복구되어 있으며, 수정 사항이 없습니다.
-    # ... create_buy_sell_tab 및 나머지 모든 메소드와 클래스 ...
     def create_buy_sell_tab(self, parent_frame, side):
         is_buy = (side == "buy")
         order_type_var = self.buy_order_type if is_buy else self.sell_order_type
@@ -789,10 +795,16 @@ class UpbitChartApp(tk.Tk):
         
         interval = self.selected_interval.get()
         if not ticker or ticker == "종목 없음": return
-        if ticker != getattr(self, 'current_chart_ticker', None):
-            self._keep_view = False; self.current_chart_ticker = ticker
+        
+        # [수정] 뷰 유지 로직을 더 명확하게 제어
+        if self.current_chart_ticker == ticker and self.selected_interval.get() == interval:
+             self._keep_view = keep_current_view
         else:
-            self._keep_view = keep_current_view
+             self._keep_view = False
+        
+        self.current_chart_ticker = ticker
+        
+        # 스레드는 항상 새로 시작하여 최신 데이터를 가져옴
         self.master_df = None
         threading.Thread(target=self._fetch_and_draw_chart, args=(ticker, interval, display_name), daemon=True).start()
 
@@ -803,19 +815,51 @@ class UpbitChartApp(tk.Tk):
         except Exception as e: print(f"❗️ 차트 데이터 로딩 오류: {e}")
 
     def _update_live_data(self, price):
-        if self.master_df is None or self.master_df.empty: return
+        if self.master_df is None or self.master_df.empty or not hasattr(self, 'fig') or not self.fig.axes:
+            return
+
         self.current_price = price
+        # 마지막 캔들 데이터 업데이트
         last_idx = self.master_df.index[-1]
         self.master_df.loc[last_idx, 'close'] = price
         if price > self.master_df.loc[last_idx, 'high']: self.master_df.loc[last_idx, 'high'] = price
         if price < self.master_df.loc[last_idx, 'low']: self.master_df.loc[last_idx, 'low'] = price
-        
+
         current_time = time.time()
-        if current_time - self.last_chart_redraw_time > 1.0:
-            self.draw_base_chart(keep_current_view=True)
-            self.last_chart_redraw_time = current_time
+        if current_time - self.last_chart_redraw_time < 1.0:
+            return
+        self.last_chart_redraw_time = current_time
+
+        # [수정] 차트 전체를 다시 그리지 않고, 필요한 부분만 업데이트
+        main_ax = self.fig.axes[0]
+        
+        # 1. 기존에 그려진 가격/평단가 라인과 텍스트를 모두 제거
+        # 'artist'는 차트에 그려진 모든 요소를 의미
+        artists_to_remove = []
+        for artist in main_ax.lines:
+            if artist.get_label() in ['_price_line', '_avg_buy_line']:
+                artists_to_remove.append(artist)
+        for artist in main_ax.texts:
+            if artist.get_label() in ['_price_text', '_avg_buy_text']:
+                artists_to_remove.append(artist)
+        
+        for artist in artists_to_remove:
+            artist.remove()
+
+        # 2. 새로운 가격/평단가 라인과 텍스트를 그림
+        blended_transform = plt.matplotlib.transforms.blended_transform_factory(main_ax.transAxes, main_ax.transData)
+        if self.current_price > 0:
+            main_ax.axhline(y=self.current_price, color='red', linestyle='--', linewidth=0.9, label='_price_line')
+            main_ax.text(1.01, self.current_price, f' {self.current_price:,.2f} ', transform=blended_transform, color='white', backgroundcolor='red', va='center', ha='left', label='_price_text')
+
+        # 3. 타이틀만 업데이트 (수익률 표시)
+        main_ax.set_title(self.get_chart_title())
+        
+        # 4. 캔버스 다시 그리기 (매우 가벼운 작업)
+        self.canvas.draw_idle()
 
     def _finalize_chart_drawing(self, df, interval, display_name):
+        # [수정] 뷰 유지 로직 단순화
         if self._keep_view and hasattr(self, 'fig') and self.fig.axes:
             cur_xlim = self.fig.axes[0].get_xlim()
             cur_ylim = self.fig.axes[0].get_ylim()
@@ -848,13 +892,36 @@ class UpbitChartApp(tk.Tk):
         profit_rate = ((self.current_price - avg_buy_price) / avg_buy_price) * 100 if avg_buy_price > 0 and self.current_price > 0 else 0
         return f'{display_name} ({self.selected_interval.get()}) Chart (수익률: {profit_rate:+.2f}%)'
 
-    def _update_chart_after_loading(self, new_df, new_xlim):
+    def _update_chart_after_loading(self, new_df, current_xlim, num_candles_added):
+        print(f"✅ 과거 캔들({num_candles_added})을 추가했습니다. 총 {len(new_df)}개")
         self.master_df = new_df
-        print(f"✅ 과거 캔들({len(new_df) - len(self.master_df)})을 추가했습니다. 총 {len(new_df)}개")
+        self._keep_view = True # 뷰 유지를 활성화
+        
         self._redraw_chart()
-        self.fig.axes[0].set_xlim(new_xlim)
-        self.canvas.draw()
+
+        try:
+            main_ax = self.fig.axes[0]
+            new_x_start = current_xlim[0] + num_candles_added
+            new_x_end = current_xlim[1] + num_candles_added
+            main_ax.set_xlim(new_x_start, new_x_end)
+
+            start_idx = max(0, int(new_x_start))
+            end_idx = min(len(new_df), int(new_x_end))
+            visible_df = new_df.iloc[start_idx:end_idx]
+
+            if not visible_df.empty:
+                min_low = visible_df['low'].min()
+                max_high = visible_df['high'].max()
+                padding = (max_high - min_low) * 0.05
+                main_ax.set_ylim(min_low - padding, max_high + padding)
+
+            self.canvas.draw()
+        except Exception as e:
+            print(f"❗️ 차트 뷰 업데이트 중 오류: {e}")
+            traceback.print_exc()
+
         self.is_loading_older = False
+        self._keep_view = False # 작업 후 뷰 유지 비활성화
 
     def _on_buy_input_change(self, *args):
         if self._is_calculating or self.buy_order_type.get() != 'limit': return
@@ -1003,16 +1070,24 @@ class UpbitChartApp(tk.Tk):
     def reset_chart_view(self):
         if self.master_df is None or len(self.master_df) < 1 or not hasattr(self, 'fig') or not self.fig.axes: return
         main_ax = self.fig.axes[0]
-        view_start, view_end = max(0, len(self.master_df) - 100), len(self.master_df) + 2
-        main_ax.set_xlim(view_start, view_end - 1)
+        
+        # [수정] 표시할 캔들 개수를 100개로 제한하여 경고 방지
+        num_candles_to_show = 100
+        view_start = max(0, len(self.master_df) - num_candles_to_show)
+        view_end = len(self.master_df)
+        
+        main_ax.set_xlim(view_start, view_end)
+        
         try:
-            visible_df = self.master_df.iloc[int(view_start):int(view_end-2)]
-            min_low, max_high = visible_df['low'].min(), visible_df['high'].max()
-            padding = (max_high - min_low) * 0.05
-            main_ax.set_ylim(min_low - padding, max_high + padding)
+            visible_df = self.master_df.iloc[int(view_start):int(view_end)]
+            if not visible_df.empty:
+                min_low, max_high = visible_df['low'].min(), visible_df['high'].max()
+                padding = (max_high - min_low) * 0.05
+                main_ax.set_ylim(min_low - padding, max_high + padding)
         except Exception as e:
             print(f"❗️ 뷰 리셋 중 Y축 범위 설정 오류: {e}")
             main_ax.autoscale(enable=True, axis='y', tight=False)
+            
         self.canvas.draw_idle()
         print("🔄️ 차트 뷰를 초기 상태로 리셋했습니다.")
 
@@ -1031,14 +1106,24 @@ class UpbitChartApp(tk.Tk):
         if not hasattr(self, 'fig') or not self.fig.axes or event.inaxes not in self.fig.axes: return
         if event.dblclick: self.reset_chart_view(); return
         self.is_panning = True
-        self.pan_start_pos = event.xdata
+        self.pan_start_pos = (event.xdata, event.ydata)
 
     def on_motion(self, event):
-        if not self.is_panning or not hasattr(self, 'fig') or not self.fig.axes or event.inaxes not in self.fig.axes or self.pan_start_pos is None or event.xdata is None: return
+        if not self.is_panning or not hasattr(self, 'fig') or not self.fig.axes or \
+           event.inaxes not in self.fig.axes or self.pan_start_pos is None or \
+           event.xdata is None or event.ydata is None:
+            return
+            
         main_ax = self.fig.axes[0]
-        dx = event.xdata - self.pan_start_pos
+        dx = event.xdata - self.pan_start_pos[0]
+        dy = event.ydata - self.pan_start_pos[1]
+
         cur_xlim = main_ax.get_xlim()
         main_ax.set_xlim([cur_xlim[0] - dx, cur_xlim[1] - dx])
+        
+        cur_ylim = main_ax.get_ylim()
+        main_ax.set_ylim([cur_ylim[0] - dy, cur_ylim[1] - dy])
+        
         self.canvas.draw_idle()
 
     def on_release(self, event):
@@ -1048,31 +1133,46 @@ class UpbitChartApp(tk.Tk):
         if not hasattr(self, 'fig') or not self.fig.axes: return
         main_ax = self.fig.axes[0]
         if main_ax.get_xlim()[0] < 1 and not self.is_loading_older:
-            print("⏳ 차트 왼쪽 끝에 도달, 과거 데이터를 로딩합니다..."); self.load_older_data()
+            self.is_loading_older = True
+            print("⏳ 차트 왼쪽 끝에 도달, 과거 데이터를 로딩합니다...")
+            self.load_older_data()
 
     def load_older_data(self):
-        if self.master_df is None or self.master_df.empty: return
-        self.is_loading_older = True
+        if self.master_df is None or self.master_df.empty:
+            self.is_loading_older = False
+            return
+            
         display_name = self.selected_ticker_display.get()
 
         for original_name, ticker_code in self.display_name_to_ticker.items():
             if display_name.endswith(original_name):
                 ticker = ticker_code; break
         else: ticker = None
-        if not ticker: return
+        if not ticker: 
+            self.is_loading_older = False
+            return
         
         interval, to_date, current_xlim = self.selected_interval.get(), self.master_df.index[0], self.fig.axes[0].get_xlim()
         threading.Thread(target=self._fetch_older_data_worker, args=(ticker, interval, to_date, current_xlim), daemon=True).start()
 
     def _fetch_older_data_worker(self, ticker, interval, to_date, current_xlim):
         try:
-            to_date_str = (pd.to_datetime(to_date) - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
-            older_df_raw = pyupbit.get_ohlcv(ticker, interval=interval, count=200, to=to_date_str)
-            if older_df_raw is None or len(older_df_raw) < 2:
-                print("ℹ️ 더 이상 로드할 과거 데이터가 없습니다."); self.is_loading_older = False; return
+            if isinstance(to_date, pd.Timestamp):
+                to_date_str = (to_date - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                to_date_str = (pd.to_datetime(to_date) - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
             
-            combined_df_raw = pd.concat([older_df_raw, self.master_df])
+            older_df_raw = pyupbit.get_ohlcv(ticker, interval=interval, count=200, to=to_date_str)
+            
+            if older_df_raw is None or older_df_raw.empty:
+                print("ℹ️ 더 이상 로드할 과거 데이터가 없습니다.")
+                self.is_loading_older = False
+                return
+            
+            current_ohlcv = self.master_df[['open', 'high', 'low', 'close', 'volume']]
+            combined_df_raw = pd.concat([older_df_raw, current_ohlcv])
             combined_df_raw = combined_df_raw[~combined_df_raw.index.duplicated(keep='last')].sort_index()
+
             df_with_indicators = self.get_technical_indicators_from_raw(combined_df_raw)
             
             if df_with_indicators is not None and not df_with_indicators.empty:
@@ -1081,11 +1181,17 @@ class UpbitChartApp(tk.Tk):
                     print(f"ℹ️ 메모리 관리를 위해 캔들 데이터를 {self.MAX_CANDLES}개로 제한합니다.")
                 
                 num_candles_added = len(df_with_indicators) - len(self.master_df)
+
                 if num_candles_added > 0:
-                    new_xlim = (current_xlim[0] + num_candles_added, current_xlim[1] + num_candles_added)
-                    self.data_queue.put(("draw_older_chart", (df_with_indicators, new_xlim))); return
-            print("ℹ️ 더 이상 로드할 과거 데이터가 없습니다.")
-        except Exception as e: print(f"❗️ 과거 데이터 로딩 중 오류 발생: {e}")
+                    self.data_queue.put(("draw_older_chart", (df_with_indicators, current_xlim, num_candles_added)))
+                    return
+                else:
+                    print("ℹ️ 추가된 신규 캔들이 없습니다 (중복 데이터).")
+
+        except Exception as e:
+            print(f"❗️ 과거 데이터 로딩 중 오류 발생: {e}")
+            traceback.print_exc()
+        
         self.is_loading_older = False
 
     def update_portfolio_gui(self, total_investment, total_valuation, total_pl, total_pl_rate, portfolio_data, krw_balance, coin_balance, coin_symbol):
