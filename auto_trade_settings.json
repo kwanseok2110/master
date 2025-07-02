@@ -1,15 +1,7 @@
 {
     "enabled_tickers": [
-        "KRW-BTC"
+        "KRW-XRP"
     ],
-    "investment_ratio": 50,
-    "strategy1": false,
-    "strategy2": true,
-    "strategy3": false,
-    "strategy4": true,
-    "strategy5": false,
-    "strategy6": true,
-    "strategy7": false,
-    "strategy8": false,
-    "is_unowned_buy_enabled": false
+    "investment_amount": 5000,
+    "max_additional_buys": 5
 }

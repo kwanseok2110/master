@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, TclError
+from tkinter import ttk, messagebox, TclError, simpledialog
 from tkinter.constants import ANCHOR, END
 import pyupbit
 import pandas as pd
@@ -13,6 +13,7 @@ import platform
 import os
 import requests
 from queue import Queue, Empty
+import json
 from datetime import datetime, timedelta
 from scipy.signal import find_peaks
 from tkinter import filedialog
@@ -49,10 +50,11 @@ if not login_file:
 try:
     with open(login_file, "r") as f:
         lines = f.readlines()
-        if len(lines) < 2:
-            raise ValueError("파일에 access key와 secret key가 모두 필요합니다.")
+        if len(lines) < 3:
+            raise ValueError("파일에 access key, secret key, 자동매매 비밀번호가 모두 필요합니다.")
         access = lines[0].strip()
         secret = lines[1].strip()
+        trade_password = lines[2].strip()
 except FileNotFoundError:
     messagebox.showerror("로그인 파일 오류", "login.txt 파일을 찾을 수 없습니다.\n선택한 파일을 확인해주세요.")
     exit()
@@ -74,7 +76,9 @@ except Exception as e:
 class UpbitChartApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("업비트 포트폴리오 & HTS (수동매매 버전)")
+        self.trade_password = trade_password
+        self.settings_window = None # 설정 창 객체 초기화
+        self.title("업비트 포트폴리오 & HTS")
         self.geometry("1600x980")
 
         # --- 상태 변수 ---
@@ -126,12 +130,37 @@ class UpbitChartApp(tk.Tk):
         self.sell_coin_balance_var = tk.StringVar(value="주문가능: 0 COIN")
         self._is_calculating = False
 
+        # --- 자동매매 관련 변수 ---
+        self.is_auto_trading = False
+        self.auto_trade_settings = {}
+        self.auto_trade_thread = None
+
         # --- 초기화 작업 ---
         self.load_ticker_names()
+        self.load_auto_trade_settings()
         self.create_widgets()
         self.add_variable_traces()
         self.load_my_tickers()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def load_auto_trade_settings(self):
+        try:
+            with open("auto_trade_settings.json", "r", encoding="utf-8") as f:
+                self.auto_trade_settings = json.load(f)
+                print("✅ 자동매매 설정 로드 완료.")
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("ℹ️ 자동매매 설정 파일 없음. 기본값으로 시작합니다.")
+            self.auto_trade_settings = {
+                'enabled_tickers': [],
+                'investment_amount': 5000,
+                'max_additional_buys': 5,
+            }
+            self.save_auto_trade_settings()
+
+    def save_auto_trade_settings(self):
+        with open("auto_trade_settings.json", "w", encoding="utf-8") as f:
+            json.dump(self.auto_trade_settings, f, ensure_ascii=False, indent=4)
+        print("💾 자동매매 설정 저장 완료.")
 
     def start_updates(self):
         self.update_loop()
@@ -198,20 +227,18 @@ class UpbitChartApp(tk.Tk):
             self.portfolio_tree.heading(cols[i], text=text)
             self.portfolio_tree.column(cols[i], width=width, anchor='e')
         self.portfolio_tree.column('display_name', anchor='w')
-
         self.portfolio_tree.tag_configure('plus', foreground='red')
         self.portfolio_tree.tag_configure('minus', foreground='blue')
-
         self.portfolio_tree.pack(fill=tk.BOTH, expand=True)
         self.portfolio_tree.bind("<Double-1>", self.on_tree_double_click)
 
-        # --- 주문 UI ---
-        order_frame = ttk.Frame(left_frame)
-        order_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
-        
-        self.order_notebook = ttk.Notebook(order_frame)
-        self.order_notebook.pack(fill=tk.BOTH, expand=True, ipady=5)
+        bottom_frame = ttk.Frame(left_frame)
+        bottom_frame.pack(fill=tk.BOTH, expand=True, pady=(5,0))
 
+        order_frame = ttk.Frame(bottom_frame)
+        order_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.order_notebook = ttk.Notebook(order_frame)
+        self.order_notebook.pack(fill=tk.BOTH, expand=True)
         buy_tab = ttk.Frame(self.order_notebook, padding=10)
         sell_tab = ttk.Frame(self.order_notebook, padding=10)
         self.order_notebook.add(buy_tab, text="매수")
@@ -219,7 +246,30 @@ class UpbitChartApp(tk.Tk):
         self.create_buy_sell_tab(buy_tab, "buy")
         self.create_buy_sell_tab(sell_tab, "sell")
 
-        # --- 우측 프레임 (차트 및 마켓 목록) ---
+        auto_trade_frame = ttk.LabelFrame(bottom_frame, text="자동매매", padding=10)
+        auto_trade_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0), expand=False)
+        
+        settings_button = ttk.Button(auto_trade_frame, text="자동매매 설정", command=self.open_settings_window)
+        settings_button.pack(pady=5, padx=5, fill='x', ipady=5)
+        
+        ttk.Style().configure("On.TButton", foreground="black", background="#4CAF50", font=('Helvetica', 10, 'bold'))
+        ttk.Style().configure("Off.TButton", foreground="black", background="#F44336", font=('Helvetica', 10, 'bold'))
+        self.auto_trade_toggle_button = ttk.Button(auto_trade_frame, text="자동매매 켜기", style="Off.TButton", command=self.toggle_auto_trading)
+        self.auto_trade_toggle_button.pack(pady=5, padx=5, fill='x', ipady=8)
+
+        log_frame = ttk.LabelFrame(left_frame, text="자동매매 로그", padding=10)
+        log_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(5,0))
+        log_text_frame = ttk.Frame(log_frame)
+        log_text_frame.pack(fill=tk.BOTH, expand=True)
+        self.log_text = tk.Text(log_text_frame, height=5, state='disabled', font=('Courier New', 9), wrap='none')
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scrollbar_y = ttk.Scrollbar(log_text_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar_y.set)
+        log_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        log_scrollbar_x = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(xscrollcommand=log_scrollbar_x.set)
+        log_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+
         right_frame = ttk.Frame(main_frame, padding=10)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
@@ -272,6 +322,75 @@ class UpbitChartApp(tk.Tk):
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas.mpl_connect('button_release_event', self.on_release)
 
+    def log_auto_trade(self, message):
+        now = datetime.now().strftime('%H:%M:%S')
+        log_message = f"[{now}] {message}"
+        def update_ui():
+            self.log_text.config(state='normal')
+            self.log_text.insert(END, log_message + "\n")
+            self.log_text.see(END)
+            self.log_text.config(state='disabled')
+            print(log_message)
+        self.after(0, update_ui)
+
+    def toggle_auto_trading(self):
+        if not self.is_auto_trading:
+            entered_password = simpledialog.askstring("비밀번호 확인", "자동매매를 시작하려면 비밀번호 4자리를 입력하세요.", show='*')
+            if entered_password is None: return
+            if entered_password == self.trade_password:
+                self.is_auto_trading = True
+                self.auto_trade_toggle_button.config(text="자동매매 끄기", style="On.TButton")
+                enabled_count = len(self.auto_trade_settings.get('enabled_tickers', []))
+                amount = self.auto_trade_settings.get('investment_amount', 5000)
+                add_buys = self.auto_trade_settings.get('max_additional_buys', 5)
+                self.log_auto_trade(f"▶️ 자동매매 시작 (대상: {enabled_count}개, 주문액: {amount:,.0f}원, 추가매수: {add_buys}회)")
+                self.auto_trade_thread = threading.Thread(target=self.auto_trade_worker, daemon=True)
+                self.auto_trade_thread.start()
+            else:
+                messagebox.showerror("인증 실패", "비밀번호가 일치하지 않습니다.")
+        else:
+            self.is_auto_trading = False
+            self.auto_trade_toggle_button.config(text="자동매매 켜기", style="Off.TButton")
+            self.log_auto_trade("⏹️ 자동매매 중지")
+
+    def open_settings_window(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+        else:
+            self.settings_window = AutoTradeSettingsWindow(self)
+            self.settings_window.grab_set()
+
+    def select_ticker_from_settings(self, selected_ticker):
+        if not selected_ticker:
+            return
+        display_name = self.ticker_to_display_name.get(selected_ticker, selected_ticker)
+        self.selected_ticker_display.set(display_name)
+        self._ignore_market_select_event = True
+        found = False
+        for iid in self.market_tree.get_children():
+            vals = self.market_tree.item(iid, "values")
+            if vals and self.display_name_to_ticker.get(vals[0]) == selected_ticker:
+                self.market_tree.selection_set(iid)
+                self.market_tree.focus(iid)
+                self.market_tree.see(iid)
+                found = True
+                break
+        if not found:
+            self.market_tree.selection_remove(self.market_tree.selection())
+        self._ignore_market_select_event = False
+        self.on_ticker_select()
+        print(f"⚙️ 자동매매 설정 저장: {display_name} 차트를 표시합니다.")
+
+    def auto_trade_worker(self):
+        self.log_auto_trade("자동매매 스레드가 시작되었습니다.")
+        while self.is_auto_trading:
+            try:
+                self.log_auto_trade("자동매매 루프 실행 중...")
+            except Exception as e:
+                self.log_auto_trade(f"❗️ 자동매매 루프 오류: {e}")
+            time.sleep(10)
+        self.log_auto_trade("자동매매 스레드가 종료되었습니다.")
+
     def get_technical_indicators(self, ticker, interval='day', count=200):
         try:
             df = pyupbit.get_ohlcv(ticker, interval=interval, count=count)
@@ -281,8 +400,7 @@ class UpbitChartApp(tk.Tk):
             return None
 
     def get_technical_indicators_from_raw(self, df, min_length=2):
-        if df is None or len(df) < min_length:
-            return None
+        if df is None or len(df) < min_length: return None
         for p in [5, 20, 60, 120]:
             df[f'ma{p}'] = df['close'].rolling(window=p, min_periods=1).mean()
         delta = df['close'].diff(1)
@@ -294,30 +412,24 @@ class UpbitChartApp(tk.Tk):
         df['ema26'] = df['close'].ewm(span=26, adjust=False, min_periods=1).mean()
         df['macd'] = df['ema12'] - df['ema26']
         df['signal'] = df['macd'].ewm(span=9, adjust=False, min_periods=1).mean()
-        
         try:
             rsi_peaks, _ = find_peaks(df['rsi'].fillna(0), distance=5, width=1)
             rsi_troughs, _ = find_peaks(-df['rsi'].fillna(0), distance=5, width=1)
-        except Exception:
-            rsi_peaks, rsi_troughs = [], []
-        
+        except Exception: rsi_peaks, rsi_troughs = [], []
         df['bearish_div'] = self._check_divergence_static(df, rsi_peaks, 'bearish')
         df['bullish_div'] = self._check_divergence_static(df, rsi_troughs, 'bullish')
         return df
 
     @staticmethod
     def _check_divergence_static(df, peaks, div_type):
-        if len(peaks) < 2:
-            return [False] * len(df)
+        if len(peaks) < 2: return [False] * len(df)
         result = [False] * len(df)
         for i in range(1, len(peaks)):
             idx1, idx2 = peaks[i-1], peaks[i]
             if div_type == 'bearish':
-                if df['rsi'].iloc[idx2] < df['rsi'].iloc[idx1] and df['high'].iloc[idx2] > df['high'].iloc[idx1]:
-                    result[idx2] = True
+                if df['rsi'].iloc[idx2] < df['rsi'].iloc[idx1] and df['high'].iloc[idx2] > df['high'].iloc[idx1]: result[idx2] = True
             elif div_type == 'bullish':
-                if df['rsi'].iloc[idx2] > df['rsi'].iloc[idx1] and df['low'].iloc[idx2] < df['low'].iloc[idx1]:
-                    result[idx2] = True
+                if df['rsi'].iloc[idx2] > df['rsi'].iloc[idx1] and df['low'].iloc[idx2] < df['low'].iloc[idx1]: result[idx2] = True
         return result
 
     def create_buy_sell_tab(self, parent_frame, side):
@@ -327,20 +439,14 @@ class UpbitChartApp(tk.Tk):
         amount_var = self.buy_amount_var if is_buy else self.sell_amount_var
         total_var = self.buy_total_var if is_buy else self.sell_total_var
         balance_var = self.buy_krw_balance_var if is_buy else self.sell_coin_balance_var
-
         top_frame = ttk.Frame(parent_frame); top_frame.pack(fill='x', expand=True, pady=(0, 5))
         order_type_frame = ttk.Frame(top_frame); order_type_frame.pack(side='left')
         ttk.Radiobutton(order_type_frame, text="지정가", variable=order_type_var, value="limit", command=self._update_order_ui_state).pack(side="left")
         ttk.Radiobutton(order_type_frame, text="시장가", variable=order_type_var, value="market", command=self._update_order_ui_state).pack(side="left")
         ttk.Label(top_frame, textvariable=balance_var, foreground='gray').pack(side='right')
-
         grid_frame = ttk.Frame(parent_frame); grid_frame.pack(fill='x', expand=True); grid_frame.columnconfigure(1, weight=1)
         labels = ["주문가격(KRW)", "주문수량(COIN)", "주문총액(KRW)"]
-        vars_entries = [
-            (price_var, ttk.Entry(grid_frame, textvariable=price_var)),
-            (amount_var, ttk.Entry(grid_frame, textvariable=amount_var)),
-            (total_var, ttk.Entry(grid_frame, textvariable=total_var))
-        ]
+        vars_entries = [(price_var, ttk.Entry(grid_frame, textvariable=price_var)), (amount_var, ttk.Entry(grid_frame, textvariable=amount_var)), (total_var, ttk.Entry(grid_frame, textvariable=total_var))]
         for i, (label_text, (var, entry)) in enumerate(zip(labels, vars_entries)):
             ttk.Label(grid_frame, text=f"{label_text: <10}").grid(row=i, column=0, sticky='w', padx=5, pady=2)
             entry.grid(row=i, column=1, sticky='ew', padx=5, pady=2)
@@ -349,13 +455,9 @@ class UpbitChartApp(tk.Tk):
                 entry_symbol.grid(row=i, column=2, sticky='w')
                 if is_buy: self.buy_amount_symbol_label = entry_symbol
                 else: self.sell_amount_symbol_label = entry_symbol
-
         entries = [e for _, e in vars_entries]
-        if is_buy:
-            self.buy_price_entry, self.buy_amount_entry, self.buy_total_entry = entries
-        else:
-            self.sell_price_entry, self.sell_amount_entry, self.sell_total_entry = entries
-
+        if is_buy: self.buy_price_entry, self.buy_amount_entry, self.buy_total_entry = entries
+        else: self.sell_price_entry, self.sell_amount_entry, self.sell_total_entry = entries
         percentage_frame = ttk.Frame(parent_frame)
         percentage_frame.pack(fill='x', expand=True, pady=5)
         if is_buy:
@@ -368,7 +470,6 @@ class UpbitChartApp(tk.Tk):
             sell_combo = ttk.Combobox(percentage_frame, textvariable=self.sell_percentage_var, values=percentages, width=10)
             sell_combo.pack(side="left", padx=5)
             sell_combo.bind("<<ComboboxSelected>>", self._on_sell_percentage_select)
-
         action_text = "매수" if is_buy else "매도"
         style = "Buy.TButton" if is_buy else "Sell.TButton"
         ttk.Style().configure(style, foreground="black", background="#d24f45" if is_buy else "#1e6bde", font=('Helvetica', 10, 'bold'))
@@ -379,35 +480,22 @@ class UpbitChartApp(tk.Tk):
         try:
             while not self.data_queue.empty():
                 task_name, data = self.data_queue.get_nowait()
-                if task_name == "update_portfolio":
-                    self.update_portfolio_gui(*data)
+                if task_name == "update_portfolio": self.update_portfolio_gui(*data)
                 elif task_name == "update_market":
                     self.market_data = data
                     self._refresh_market_tree_gui()
-                elif task_name == "update_live_candle":
-                    self._update_live_data(data)
-                elif task_name == "draw_chart":
-                    self._finalize_chart_drawing(*data)
-                elif task_name == "draw_older_chart":
-                    self._update_chart_after_loading(*data)
-        except Empty:
-            pass
+                elif task_name == "update_live_candle": self._update_live_data(data)
+                elif task_name == "draw_chart": self._finalize_chart_drawing(*data)
+                elif task_name == "draw_older_chart": self._update_chart_after_loading(*data)
+        except Empty: pass
         finally:
-            if self.is_running:
-                self.after(100, self.process_queue)
+            if self.is_running: self.after(100, self.process_queue)
 
     def update_loop(self):
-        if not self.is_running:
-            return
-
+        if not self.is_running: return
         threading.Thread(target=self.fetch_current_price, daemon=True).start()
-
-        if self.update_loop_counter % 5 == 0:
-            threading.Thread(target=self._fetch_portfolio_data_worker, daemon=True).start()
-
-        if self.update_loop_counter % 10 == 0:
-            threading.Thread(target=self._fetch_market_data_worker, daemon=True).start()
-
+        if self.update_loop_counter % 5 == 0: threading.Thread(target=self._fetch_portfolio_data_worker, daemon=True).start()
+        if self.update_loop_counter % 10 == 0: threading.Thread(target=self._fetch_market_data_worker, daemon=True).start()
         self.update_loop_counter += 1
         self.after(1000, self.update_loop)
 
@@ -417,10 +505,8 @@ class UpbitChartApp(tk.Tk):
         if ticker and ticker != "종목 없음":
             try:
                 price = pyupbit.get_current_price(ticker)
-                if price is not None:
-                    self.data_queue.put(("update_live_candle", price))
-            except Exception as e:
-                print(f"❗️ 현재가 조회 오류: {e}")
+                if price is not None: self.data_queue.put(("update_live_candle", price))
+            except Exception as e: print(f"❗️ 현재가 조회 오류: {e}")
 
     def _fetch_portfolio_data_worker(self):
         try:
@@ -428,23 +514,16 @@ class UpbitChartApp(tk.Tk):
             self.balances_data = {f"KRW-{b['currency']}": b for b in balances if b['currency'] != 'KRW'}
             krw_balance = next((float(b['balance']) for b in balances if b['currency'] == 'KRW'), 0.0)
             krw_balances_data = {f"KRW-{b['currency']}": b for b in balances if b['currency'] != 'KRW' and float(b.get('balance', 0)) > 0}
-
             display_name = self.selected_ticker_display.get()
             ticker = self.display_name_to_ticker.get(display_name)
-
             tickers_to_fetch = set(krw_balances_data.keys())
-            if ticker:
-                tickers_to_fetch.add(ticker)
-
+            if ticker: tickers_to_fetch.add(ticker)
             current_prices_dict = {}
             if tickers_to_fetch:
                 price_data = pyupbit.get_current_price(list(tickers_to_fetch))
-                if price_data:
-                    current_prices_dict = price_data if isinstance(price_data, dict) else {list(tickers_to_fetch)[0]: price_data}
-
+                if price_data: current_prices_dict = price_data if isinstance(price_data, dict) else {list(tickers_to_fetch)[0]: price_data}
             total_investment, total_valuation = 0.0, 0.0
             portfolio_data_list = []
-
             for t, balance_info in krw_balances_data.items():
                 balance = float(balance_info['balance'])
                 avg_price = float(balance_info['avg_buy_price'])
@@ -453,20 +532,13 @@ class UpbitChartApp(tk.Tk):
                 valuation = balance * cur_price
                 total_investment += investment
                 total_valuation += valuation
-                portfolio_data_list.append({
-                    'ticker': t, 'balance': balance, 'avg_price': avg_price,
-                    'cur_price': cur_price, 'valuation': valuation, 'pl': valuation - investment
-                })
-
+                portfolio_data_list.append({'ticker': t, 'balance': balance, 'avg_price': avg_price, 'cur_price': cur_price, 'valuation': valuation, 'pl': valuation - investment})
             coin_balance = float(krw_balances_data.get(ticker, {}).get('balance', 0.0))
             coin_symbol = ticker.split('-')[1] if ticker and '-' in ticker else "COIN"
-
             total_pl = total_valuation - total_investment
             total_pl_rate = (total_pl / total_investment) * 100 if total_investment > 0 else 0
-
             result_data = (total_investment, total_valuation, total_pl, total_pl_rate, portfolio_data_list, krw_balance, coin_balance, coin_symbol)
             self.data_queue.put(("update_portfolio", result_data))
-
         except Exception as e:
             print(f"❗️ 포트폴리오 업데이트 오류: {e}")
 
@@ -477,10 +549,8 @@ class UpbitChartApp(tk.Tk):
             response = requests.get(url)
             response.raise_for_status()
             market_data = response.json()
-            if market_data:
-                self.data_queue.put(("update_market", market_data))
-        except Exception as e:
-            print(f"❗️ KRW 마켓 목록 업데이트 중 오류: {e}")
+            if market_data: self.data_queue.put(("update_market", market_data))
+        except Exception as e: print(f"❗️ KRW 마켓 목록 업데이트 중 오류: {e}")
 
     def on_ticker_select(self, event=None):
         self.draw_base_chart()
@@ -497,10 +567,8 @@ class UpbitChartApp(tk.Tk):
         ticker = self.display_name_to_ticker.get(display_name, display_name)
         interval = self.selected_interval.get()
         if not ticker or ticker == "종목 없음": return
-        if hasattr(self, "_keep_view") and self._keep_view:
-            pass
-        else:
-            self._keep_view = False
+        if hasattr(self, "_keep_view") and self._keep_view: pass
+        else: self._keep_view = False
         self.master_df = None
         threading.Thread(target=self._fetch_and_draw_chart, args=(ticker, interval, display_name), daemon=True).start()
 
@@ -508,28 +576,20 @@ class UpbitChartApp(tk.Tk):
         try:
             df = self.get_technical_indicators(ticker, interval=interval, count=200)
             self.data_queue.put(("draw_chart", (df, interval, display_name)))
-        except Exception as e:
-            print(f"❗️ 차트 데이터 로딩 오류: {e}")
+        except Exception as e: print(f"❗️ 차트 데이터 로딩 오류: {e}")
 
     def _update_live_data(self, price):
-        if self.master_df is None or self.master_df.empty:
-            return
-
+        if self.master_df is None or self.master_df.empty: return
         self.current_price = price
-
         last_idx = self.master_df.index[-1]
         self.master_df.loc[last_idx, 'close'] = price
-        if price > self.master_df.loc[last_idx, 'high']:
-            self.master_df.loc[last_idx, 'high'] = price
-        if price < self.master_df.loc[last_idx, 'low']:
-            self.master_df.loc[last_idx, 'low'] = price
-
+        if price > self.master_df.loc[last_idx, 'high']: self.master_df.loc[last_idx, 'high'] = price
+        if price < self.master_df.loc[last_idx, 'low']: self.master_df.loc[last_idx, 'low'] = price
         self.update_overlays()
         self.canvas.draw_idle()
 
     def _finalize_chart_drawing(self, df, interval, display_name):
         self.master_df = df
-
         if self.master_df is None or len(self.master_df) < 2:
             self.ax.clear()
             self.ax.text(0.5, 0.5, "차트 데이터가 없습니다.", horizontalalignment='center', verticalalignment='center')
@@ -537,68 +597,47 @@ class UpbitChartApp(tk.Tk):
             self.master_df = None
             self._keep_view = False
             return
-
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
-
         self._redraw_chart()
-
         if hasattr(self, "_keep_view") and self._keep_view and all(cur_xlim) and all(cur_ylim):
             try:
                 self.ax.set_xlim(cur_xlim)
                 self.ax.set_ylim(cur_ylim)
-            except Exception:
-                self.reset_chart_view()
-        else:
-            self.reset_chart_view()
-
+            except Exception: self.reset_chart_view()
+        else: self.reset_chart_view()
         self.canvas.draw()
         self._keep_view = False
 
     def _redraw_chart(self):
         self.ax.clear()
         for key in self.chart_elements: self.chart_elements[key].clear()
-
         if self.master_df is None or self.master_df.empty:
             self.canvas.draw()
             return
-
         display_name = self.selected_ticker_display.get()
-        
         ma_data_to_plot, bb_data_to_plot = {}, {}
-
         for period, var in self.ma_vars.items():
             if var.get() and f'ma{period}' in self.master_df.columns:
                 ma_data_to_plot[period] = self.master_df[f'ma{period}']
-
         if self.bb_var.get():
             bb_period = 20
             middle = self.master_df['close'].rolling(window=bb_period).mean()
             std = self.master_df['close'].rolling(window=bb_period).std()
             bb_data_to_plot = {'upper': middle + (std * 2), 'middle': middle, 'lower': middle - (std * 2)}
-
         current_interval = self.selected_interval.get()
         dt_format = '%m-%d %H:%M' if current_interval not in ['day', 'week'] else '%Y-%m-%d'
-
-        # `addplot`에서 거래내역 플롯 제거
-        mpf.plot(self.master_df, type='candle', ax=self.ax, style='yahoo',
-                 ylabel='Price (KRW)', datetime_format=dt_format, xrotation=20)
-
+        mpf.plot(self.master_df, type='candle', ax=self.ax, style='yahoo', ylabel='Price (KRW)', datetime_format=dt_format, xrotation=20)
         all_lows, all_highs = self.master_df['low'], self.master_df['high']
-
         data_min, data_max = all_lows.min(), all_highs.max()
         padding = (data_max - data_min) * 0.1
         y_bound_min = max(0, data_min - padding)
         y_bound_max = data_max + padding
         self.data_bounds = {'x': (0, len(self.master_df) - 1), 'y': (y_bound_min, y_bound_max)}
-
         self.plot_moving_averages(ma_data_to_plot)
         self.plot_bollinger_bands(bb_data_to_plot)
-
         self.ax.grid(True, linestyle='--', alpha=0.6)
-        if ma_data_to_plot or bb_data_to_plot:
-            self.ax.legend()
-
+        if ma_data_to_plot or bb_data_to_plot: self.ax.legend()
         self.update_overlays()
         print(f"📈 {display_name} ({self.selected_interval.get()}) 차트를 새로 그렸습니다. (총 {len(self.master_df)}개 캔들)")
 
@@ -649,9 +688,7 @@ class UpbitChartApp(tk.Tk):
         if buy_type == 'market':
             self.buy_price_var.set("")
             self.buy_amount_var.set("")
-        else: # limit
-            self.buy_total_entry.config(state='normal')
-
+        else: self.buy_total_entry.config(state='normal')
         sell_type = self.sell_order_type.get()
         self.sell_price_entry.config(state='normal' if sell_type == 'limit' else 'disabled')
         self.sell_amount_entry.config(state='normal')
@@ -666,34 +703,19 @@ class UpbitChartApp(tk.Tk):
         if buy_type == 'limit':
             try:
                 price = float(self.buy_price_var.get())
-                if price > 0:
-                    self.buy_amount_var.set(f"{total_krw / price * 0.9995:g}") # 수수료 고려
-                else:
-                    messagebox.showwarning("가격 입력 필요", "주문 가격을 먼저 입력해주세요.")
-            except (ValueError, TclError):
-                messagebox.showwarning("가격 입력 필요", "유효한 주문 가격을 먼저 입력해주세요.")
-        else: # market
-            self.buy_total_var.set(f"{total_krw:.0f}")
+                if price > 0: self.buy_amount_var.set(f"{total_krw / price * 0.9995:g}")
+                else: messagebox.showwarning("가격 입력 필요", "주문 가격을 먼저 입력해주세요.")
+            except (ValueError, TclError): messagebox.showwarning("가격 입력 필요", "유효한 주문 가격을 먼저 입력해주세요.")
+        else: self.buy_total_var.set(f"{total_krw:.0f}")
 
     def _on_sell_percentage_select(self, event=None):
         try:
             percentage_str = self.sell_percentage_var.get()
             if not percentage_str: return
-            
             percentage = float(percentage_str.replace('%', '')) / 100
-            
-            # [핵심 수정]
-            # self.coin_balance는 이미 float 형태의 최대 정밀도 값을 가지고 있음
-            # 이 값을 그대로 사용하여 계산하고, GUI에 표시할 때만 보기 좋게 포맷팅
             amount_to_sell = self.coin_balance * percentage
-            
-            # sell_amount_var 변수에는 계산된 최대 정밀도 값을 그대로 문자열로 변환하여 설정
-            # format()이나 f-string의 g 포맷 대신, str()을 사용하여 정밀도 손실 방지
             self.sell_amount_var.set(str(amount_to_sell))
-            
-            # 콤보박스 선택 후에는 선택된 값 비우기 (사용자 경험 개선)
             self.sell_percentage_var.set('')
-
         except (ValueError, TclError) as e:
             print(f"매도 비율 계산 중 오류: {e}")
             pass
@@ -704,107 +726,65 @@ class UpbitChartApp(tk.Tk):
         if not ticker:
             messagebox.showerror("오류", "주문할 종목이 선택되지 않았습니다.")
             return
-
         is_buy = (side == "buy")
         order_type = self.buy_order_type.get() if is_buy else self.sell_order_type.get()
-        
-        # 변수 초기화
-        price = None
-        amount = 0.0
-        total_krw = 0.0
-        order_params = ()
-        amount_label, amount_unit, amount_display = "", "", ""
-
+        price, amount, total_krw = None, 0.0, 0.0
+        order_params, amount_label, amount_unit, amount_display = (), "", "", ""
         try:
             if order_type == 'limit':
-                # 지정가 주문: 가격과 수량 모두 필요
                 price_str = self.buy_price_var.get() if is_buy else self.sell_price_var.get()
                 amount_str = self.buy_amount_var.get() if is_buy else self.sell_amount_var.get()
-                if not price_str or not amount_str:
-                    raise ValueError("지정가 주문 시 가격과 수량을 모두 입력해야 합니다.")
-                
-                price = float(price_str)
-                amount = float(amount_str)
-
-                if price <= 0 or amount <= 0:
-                    raise ValueError("가격과 수량은 0보다 커야 합니다.")
-                
+                if not price_str or not amount_str: raise ValueError("지정가 주문 시 가격과 수량을 모두 입력해야 합니다.")
+                price, amount = float(price_str), float(amount_str)
+                if price <= 0 or amount <= 0: raise ValueError("가격과 수량은 0보다 커야 합니다.")
                 order_params = (ticker, price, amount)
                 amount_label, amount_unit, amount_display = "주문 수량", ticker.split('-')[1], f"{amount:g}"
-
-            else:  # 시장가 주문
+            else:
                 if is_buy:
-                    # 시장가 매수: 총액(KRW) 필요
                     total_krw_str = self.buy_total_var.get()
-                    if not total_krw_str:
-                        raise ValueError("시장가 매수 시 주문 총액(KRW)을 입력해야 합니다.")
-                    
+                    if not total_krw_str: raise ValueError("시장가 매수 시 주문 총액(KRW)을 입력해야 합니다.")
                     total_krw = float(total_krw_str)
-                    if total_krw < 5000:
-                        raise ValueError("시장가 매수 주문은 5,000원 이상이어야 합니다.")
-
+                    if total_krw < 5000: raise ValueError("시장가 매수 주문은 5,000원 이상이어야 합니다.")
                     order_params = (ticker, total_krw)
                     amount_label, amount_unit, amount_display = "주문 총액", "KRW", f"{total_krw:,.0f}"
                 else:
-                    # 시장가 매도: 수량(COIN) 필요
                     user_amount_str = self.sell_amount_var.get()
-                    if not user_amount_str:
-                        raise ValueError("시장가 매도 시 주문 수량(COIN)을 입력해야 합니다.")
-                    
+                    if not user_amount_str: raise ValueError("시장가 매도 시 주문 수량(COIN)을 입력해야 합니다.")
                     user_amount = float(user_amount_str)
-                    if user_amount <= 0:
-                         raise ValueError("주문 수량은 0보다 커야 합니다.")
-
+                    if user_amount <= 0: raise ValueError("주문 수량은 0보다 커야 합니다.")
                     sellable_balance = upbit.get_balance(ticker)
                     amount_to_sell = min(user_amount, sellable_balance)
-
                     current_price = pyupbit.get_current_price(ticker)
                     if current_price and (amount_to_sell * current_price < 5000):
                         raise ValueError(f"주문 금액이 최소 기준(5,000원) 미만입니다.\n(예상 주문액: {amount_to_sell * current_price:,.0f}원)")
-                    
-                    if amount_to_sell <= 0:
-                        raise ValueError("매도 가능한 코인 수량이 없습니다.")
-
+                    if amount_to_sell <= 0: raise ValueError("매도 가능한 코인 수량이 없습니다.")
                     order_params = (ticker, amount_to_sell)
                     amount_label, amount_unit, amount_display = "주문 수량", ticker.split('-')[1], f"{amount_to_sell:g}"
-
         except ValueError as ve:
             messagebox.showerror("입력 오류", f"{ve}")
             return
         except TclError:
             messagebox.showerror("입력 오류", "유효한 숫자를 입력하세요.")
             return
-
         order_side_text = "매수" if is_buy else "매도"
         order_type_text = "지정가" if order_type == 'limit' else "시장가"
         price_text = f"주문 가격: {price:,.0f} KRW\n" if price is not None else ""
-
         confirm_msg = (f"[[ 주문 확인 ]]\n\n종목: {display_name}\n종류: {order_side_text} / {order_type_text}\n{price_text}{amount_label}: {amount_display} {amount_unit}\n\n위 내용으로 주문하시겠습니까?")
-
-        if not messagebox.askyesno("주문 확인", confirm_msg):
-            return
-
+        if not messagebox.askyesno("주문 확인", confirm_msg): return
         try:
             result = None
             print(f"▶️ 주문 실행: {side}, {order_type}, params: {order_params}")
             if is_buy:
-                if order_type == 'limit':
-                    result = upbit.buy_limit_order(*order_params)
-                else:
-                    result = upbit.buy_market_order(*order_params)
+                if order_type == 'limit': result = upbit.buy_limit_order(*order_params)
+                else: result = upbit.buy_market_order(*order_params)
             else:
-                if order_type == 'limit':
-                    result = upbit.sell_limit_order(*order_params)
-                else:
-                    result = upbit.sell_market_order(*order_params)
-
+                if order_type == 'limit': result = upbit.sell_limit_order(*order_params)
+                else: result = upbit.sell_market_order(*order_params)
             messagebox.showinfo("주문 성공", f"주문이 성공적으로 접수되었습니다.\n\n{result}")
             self.buy_price_var.set(""); self.buy_amount_var.set(""); self.buy_total_var.set("")
             self.sell_price_var.set(""); self.sell_amount_var.set(""); self.sell_total_var.set("")
-
             print("ℹ️ 주문 체결 대기... 2초 후 잔고를 갱신합니다.")
             self.after(2000, lambda: threading.Thread(target=self._fetch_portfolio_data_worker, daemon=True).start())
-
         except Exception as e:
             messagebox.showerror("주문 실패", f"주문 중 오류가 발생했습니다.\n\n오류 유형: {type(e).__name__}\n메시지: {e}")
             print(f"❗️ 주문 실패: {e}")
@@ -815,11 +795,8 @@ class UpbitChartApp(tk.Tk):
         item_values = self.portfolio_tree.item(item_id, "values")
         display_name = item_values[0]
         if not display_name: return
-
         self._ignore_market_select_event = True
-        
         self.selected_ticker_display.set(display_name)
-        
         found = False
         for iid in self.market_tree.get_children():
             vals = self.market_tree.item(iid, "values")
@@ -828,18 +805,13 @@ class UpbitChartApp(tk.Tk):
                 self.market_tree.focus(iid)
                 found = True
                 break
-        if not found:
-            self.market_tree.selection_remove(self.market_tree.selection())
-            self.market_tree.focus('')
-
+        if not found: self.market_tree.selection_remove(self.market_tree.selection())
         self._ignore_market_select_event = False
         self.on_ticker_select()
-        
         print(f"📋 포트폴리오 더블클릭: {display_name} 차트를 표시합니다.")
 
     def on_market_list_select(self, event):
-        if getattr(self, '_ignore_market_select_event', False):
-            return
+        if getattr(self, '_ignore_market_select_event', False): return
         selection = self.market_tree.selection()
         if not selection: return
         item = self.market_tree.item(selection[0])
@@ -847,23 +819,18 @@ class UpbitChartApp(tk.Tk):
         if self.selected_ticker_display.get() == display_name:
             self._keep_view = True
             return
-        else:
-            self._keep_view = False
-
+        else: self._keep_view = False
         self.portfolio_tree.selection_remove(self.portfolio_tree.selection())
         self.portfolio_tree.focus('')
-
         self.selected_ticker_display.set(display_name)
         self.on_ticker_select()
         print(f"💹 거래대금 목록 선택: {display_name} 차트를 표시합니다.")
 
     def reset_chart_view(self):
         if self.master_df is None or len(self.master_df) < 1: return
-
         view_start = max(0, len(self.master_df) - 200)
         view_end = len(self.master_df) + 2
         self.ax.set_xlim(view_start, view_end - 1)
-
         try:
             visible_df = self.master_df.iloc[int(view_start):int(view_end-2)]
             min_low = visible_df['low'].min()
@@ -873,7 +840,6 @@ class UpbitChartApp(tk.Tk):
         except Exception as e:
             print(f"❗️ 뷰 리셋 중 Y축 범위 설정 오류: {e}")
             self.ax.autoscale(enable=True, axis='y', tight=False)
-
         self.canvas.draw_idle()
         print("🔄️ 차트 뷰를 초기 상태로 리셋했습니다.")
 
@@ -941,18 +907,15 @@ class UpbitChartApp(tk.Tk):
                 to_date_str = (to_date - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
             else:
                 to_date_str = (pd.to_datetime(to_date) - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
-
             older_df_raw = pyupbit.get_ohlcv(ticker, interval=interval, count=200, to=to_date_str)
             if older_df_raw is None or len(older_df_raw) < 2:
                 print("ℹ️ 더 이상 로드할 과거 데이터가 없습니다.")
                 self.is_loading_older = False
                 return
-
             current_ohlcv = self.master_df[['open', 'high', 'low', 'close', 'volume']]
             combined_df_raw = pd.concat([older_df_raw, current_ohlcv])
             combined_df_raw = combined_df_raw[~combined_df_raw.index.duplicated(keep='last')]
             combined_df_raw = combined_df_raw.sort_index()
-
             df_with_indicators = self.get_technical_indicators_from_raw(combined_df_raw, min_length=2)
             if df_with_indicators is not None and not df_with_indicators.empty:
                 num_candles_added = len(df_with_indicators) - len(self.master_df)
@@ -985,52 +948,32 @@ class UpbitChartApp(tk.Tk):
     def update_portfolio_gui(self, total_investment, total_valuation, total_pl, total_pl_rate, portfolio_data, krw_balance, coin_balance, coin_symbol):
         self.krw_balance = krw_balance
         self.coin_balance = coin_balance
-
         self.krw_balance_summary_var.set(f"보유 KRW: {krw_balance:,.0f} 원")
         self.total_investment_var.set(f"총 투자금액: {total_investment:,.0f} 원")
         self.total_valuation_var.set(f"총 평가금액: {total_valuation:,.0f} 원")
         self.total_pl_var.set(f"총 평가손익: {total_pl:,.0f} 원 ({total_pl_rate:+.2f}%)")
-
         self.portfolio_tree.delete(*self.portfolio_tree.get_children())
         for item in portfolio_data:
             display_name = self.ticker_to_display_name.get(item['ticker'], item['ticker'])
-            balance = item['balance']
-            avg_price = item['avg_price']
-            cur_price = item['cur_price']
-            valuation = item['valuation']
-            pl = item['pl']
+            balance, avg_price, cur_price, valuation, pl = item['balance'], item['avg_price'], item['cur_price'], item['valuation'], item['pl']
             pl_rate = (pl / (avg_price * balance) * 100) if avg_price > 0 and balance > 0 else 0
             tag = 'plus' if pl > 0 else 'minus' if pl < 0 else ''
-            self.portfolio_tree.insert('', 'end', values=(
-                display_name, f"{balance:.8f}".rstrip('0').rstrip('.'), f"{avg_price:,.2f}", f"{cur_price:,.2f}",
-                f"{valuation:,.0f}", f"{pl:,.0f}", f"{pl_rate:+.2f}%"
-            ), tags=(tag,))
-
+            self.portfolio_tree.insert('', 'end', values=(display_name, f"{balance:.8f}".rstrip('0').rstrip('.'), f"{avg_price:,.2f}", f"{cur_price:,.2f}", f"{valuation:,.0f}", f"{pl:,.0f}", f"{pl_rate:+.2f}%"), tags=(tag,))
         self.pie_ax.clear()
         if portfolio_data and total_valuation > 0:
             chart_data = [{'label': self.ticker_to_display_name.get(item['ticker'], item['ticker']), 'value': item['valuation']} for item in portfolio_data]
             main_items, other_items_value = [], 0.0
             sorted_chart_data = sorted(chart_data, key=lambda x: x['value'], reverse=True)
-
             for item in sorted_chart_data:
                 percentage = (item['value'] / total_valuation) * 100
-                if len(main_items) < 7 and percentage >= 2.0:
-                    main_items.append(item)
-                else:
-                    other_items_value += item['value']
-
-            if other_items_value > 0:
-                main_items.append({'label': '기타', 'value': other_items_value})
-
+                if len(main_items) < 7 and percentage >= 2.0: main_items.append(item)
+                else: other_items_value += item['value']
+            if other_items_value > 0: main_items.append({'label': '기타', 'value': other_items_value})
             labels = [item['label'].split('(')[0] for item in main_items][::-1]
             percentages = [(item['value'] / total_valuation) * 100 for item in main_items][::-1]
-
             num_items = len(labels)
-            try:
-                colors = plt.colormaps.get_cmap('viridis_r')(np.linspace(0, 1, num_items))
-            except AttributeError:
-                colors = plt.cm.get_cmap('viridis_r', num_items)(range(num_items))
-
+            try: colors = plt.colormaps.get_cmap('viridis_r')(np.linspace(0, 1, num_items))
+            except AttributeError: colors = plt.cm.get_cmap('viridis_r', num_items)(range(num_items))
             bars = self.pie_ax.barh(labels, percentages, color=colors, height=0.6)
             self.pie_ax.set_xlabel('비중 (%)', fontsize=9)
             self.pie_ax.tick_params(axis='y', labelsize=9)
@@ -1043,10 +986,8 @@ class UpbitChartApp(tk.Tk):
         else:
             self.pie_ax.text(0.5, 0.5, "보유 코인이 없습니다", horizontalalignment='center', verticalalignment='center')
             self.pie_ax.set_xticks([]); self.pie_ax.set_yticks([])
-
         self.pie_fig.tight_layout()
         self.pie_canvas.draw()
-
         self.buy_krw_balance_var.set(f"주문가능: {krw_balance:,.0f} KRW")
         self.sell_coin_balance_var.set(f"주문가능: {coin_balance:g} {coin_symbol}")
 
@@ -1054,7 +995,7 @@ class UpbitChartApp(tk.Tk):
         if not self.market_data: return
         sort_key_map = { 'display_name': 'market', 'price': 'trade_price', 'change_rate': 'signed_change_rate', 'volume': 'acc_trade_price_24h' }
         key_to_sort = sort_key_map.get(self.sort_column, 'acc_trade_price_24h')
-        sorted_data = sorted(self.market_data, key=lambda x: x[key_to_sort], reverse=not self.sort_ascending)
+        sorted_data = sorted(self.market_data, key=lambda x: x.get(key_to_sort, 0), reverse=not self.sort_ascending)
         try:
             selected_id = self.market_tree.focus()
             selected_display_name = self.market_tree.item(selected_id, 'values')[0] if selected_id else None
@@ -1087,10 +1028,8 @@ class UpbitChartApp(tk.Tk):
     def _load_my_tickers_worker(self):
         balances = upbit.get_balances()
         my_tickers = [f"KRW-{b['currency']}" for b in balances if b['currency'] != 'KRW' and float(b.get('balance', 0)) > 0]
-
         all_display_names = sorted(list(self.display_name_to_ticker.keys()))
         self.after(0, lambda: self.ticker_combobox.config(values=all_display_names))
-
         if my_tickers:
             first_ticker = my_tickers[0]
             display_name = self.ticker_to_display_name.get(first_ticker, first_ticker)
@@ -1099,7 +1038,6 @@ class UpbitChartApp(tk.Tk):
             self.selected_ticker_display.set(all_display_names[0])
         else:
             self.selected_ticker_display.set("종목 없음")
-
         self.after(0, self.on_ticker_select)
 
     def update_overlays(self):
@@ -1107,27 +1045,20 @@ class UpbitChartApp(tk.Tk):
             try: element.remove()
             except: pass
         self.chart_elements['overlay'].clear()
-
         if self.master_df is None: return
-
         display_name = self.selected_ticker_display.get()
         ticker = self.display_name_to_ticker.get(display_name)
         if not ticker: return
-
         current_xlim = self.ax.get_xlim()
         current_ylim = self.ax.get_ylim()
-
         self.avg_buy_price = float(self.balances_data.get(ticker, {}).get('avg_buy_price', 0.0))
         profit_rate = ((self.current_price - self.avg_buy_price) / self.avg_buy_price) * 100 if self.avg_buy_price > 0 and self.current_price > 0 else 0
         self.ax.set_title(f'{display_name} ({self.selected_interval.get()}) Chart (수익률: {profit_rate:+.2f}%)', fontsize=14)
-
         right_limit = current_xlim[1]
-
         if self.current_price > 0 and current_ylim[0] < self.current_price < current_ylim[1]:
             line = self.ax.axhline(y=self.current_price, color='red', linestyle='--')
             text = self.ax.text(right_limit, self.current_price, f' {self.current_price:,.2f}', color='red', va='center', ha='left', bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
             self.chart_elements['overlay'].extend([line, text])
-
         if self.avg_buy_price > 0 and current_ylim[0] < self.avg_buy_price < current_ylim[1]:
             line = self.ax.axhline(y=self.avg_buy_price, color='blue', linestyle=':')
             text = self.ax.text(right_limit, self.avg_buy_price, f' {self.avg_buy_price:,.2f}', color='blue', va='center', ha='left', bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
@@ -1135,7 +1066,141 @@ class UpbitChartApp(tk.Tk):
 
     def on_closing(self):
         self.is_running = False
+        if hasattr(self, 'settings_window') and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
         self.destroy()
+
+class AutoTradeSettingsWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.master_app = master
+        self.title("자동매매 설정")
+        self.geometry("400x450")
+        self.resizable(False, False)
+
+        self.vars = {
+            'investment_amount': tk.StringVar(),
+            'max_additional_buys': tk.StringVar(),
+        }
+
+        self.setup_widgets()
+        self.load_settings()
+
+    def setup_widgets(self):
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        tickers_frame = ttk.LabelFrame(main_frame, text="[1] 자동매매 대상 종목 (거래대금 상위 10개, 단일 선택)", padding=10)
+        tickers_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        list_frame = ttk.Frame(tickers_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.ticker_listbox = tk.Listbox(list_frame, selectmode='browse', exportselection=False)
+        self.ticker_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.ticker_listbox.yview)
+        self.ticker_listbox.config(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        refresh_button = ttk.Button(tickers_frame, text="목록 새로고침", command=self.populate_top_tickers)
+        refresh_button.pack(pady=(5,0), fill='x')
+
+        options_frame = ttk.LabelFrame(main_frame, text="[2] 설정 금액", padding=10)
+        options_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(options_frame, text="1회 매수 금액 (원):").pack(side=tk.LEFT, padx=5)
+        self.amount_entry = ttk.Entry(options_frame, textvariable=self.vars['investment_amount'], width=15)
+        self.amount_entry.pack(side=tk.LEFT)
+
+        add_buy_frame = ttk.LabelFrame(main_frame, text="[3] 추가 매수 설정", padding=10)
+        add_buy_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(add_buy_frame, text="추가 매수 횟수 (최대 10회):").pack(side=tk.LEFT, padx=5)
+        buy_counts = [str(i) for i in range(0, 11)]
+        self.add_buy_combo = ttk.Combobox(add_buy_frame, textvariable=self.vars['max_additional_buys'], values=buy_counts, width=5, state="readonly")
+        self.add_buy_combo.pack(side=tk.LEFT)
+        self.add_buy_combo.set('5')
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(button_frame, text="저장", command=self.save_and_close).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="닫기", command=self.destroy).pack(side=tk.RIGHT)
+
+    def populate_top_tickers(self):
+        self.ticker_listbox.delete(0, END)
+        market_data = self.master_app.market_data
+        if not market_data:
+            messagebox.showwarning("데이터 없음", "아직 마켓 데이터가 로드되지 않았습니다.\n잠시 후 다시 시도해주세요.", parent=self)
+            return
+        try:
+            top_10 = sorted(market_data, key=lambda x: x.get('acc_trade_price_24h', 0), reverse=True)[:10]
+            for item in top_10:
+                ticker = item['market']
+                display_name = self.master_app.ticker_to_display_name.get(ticker, ticker)
+                self.ticker_listbox.insert(END, display_name)
+            self.restore_selection()
+            print("✅ 거래대금 상위 10개 종목을 리스트에 업데이트했습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", f"종목 목록을 불러오는 중 오류가 발생했습니다:\n{e}", parent=self)
+
+    def load_settings(self):
+        s = self.master_app.auto_trade_settings
+        self.vars['investment_amount'].set(str(s.get('investment_amount', 5000)))
+        self.vars['max_additional_buys'].set(str(s.get('max_additional_buys', 5)))
+        self.populate_top_tickers()
+
+    def restore_selection(self):
+        s = self.master_app.auto_trade_settings
+        enabled_tickers = s.get('enabled_tickers', [])
+        if not enabled_tickers:
+            return
+        selected_ticker = enabled_tickers[0] 
+        for i in range(self.ticker_listbox.size()):
+            display_name = self.ticker_listbox.get(i)
+            ticker = self.master_app.display_name_to_ticker.get(display_name)
+            if ticker == selected_ticker:
+                self.ticker_listbox.selection_set(i)
+                self.ticker_listbox.activate(i)
+                break
+
+    def save_and_close(self):
+        try:
+            new_settings = {}
+            selected_ticker_for_chart = None
+            
+            selected_indices = self.ticker_listbox.curselection()
+            enabled_tickers = []
+            if selected_indices:
+                selected_index = selected_indices[0]
+                display_name = self.ticker_listbox.get(selected_index)
+                ticker = self.master_app.display_name_to_ticker.get(display_name)
+                if ticker:
+                    enabled_tickers.append(ticker)
+                    selected_ticker_for_chart = ticker
+
+            new_settings['enabled_tickers'] = enabled_tickers
+
+            amount = int(self.vars['investment_amount'].get())
+            if amount < 5000:
+                messagebox.showwarning("금액 확인", "최소 주문 금액은 5,000원입니다.", parent=self)
+                return
+            new_settings['investment_amount'] = amount
+
+            new_settings['max_additional_buys'] = int(self.vars['max_additional_buys'].get())
+
+            self.master_app.auto_trade_settings = new_settings
+            self.master_app.save_auto_trade_settings()
+            
+            if selected_ticker_for_chart:
+                self.master_app.select_ticker_from_settings(selected_ticker_for_chart)
+
+            messagebox.showinfo("저장 완료", "자동매매 설정이 저장되었습니다.", parent=self)
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("입력 오류", "매수 금액은 숫자로 입력해야 합니다.", parent=self)
+        except Exception as e:
+            messagebox.showerror("오류", f"설정 저장 중 오류가 발생했습니다: {e}", parent=self)
 
 if __name__ == "__main__":
     app = UpbitChartApp()
