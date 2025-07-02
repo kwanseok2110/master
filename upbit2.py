@@ -74,6 +74,8 @@ except Exception as e:
 # 2. GUI 클래스 및 기능
 # -----------------------------------------------------------------------------
 class UpbitChartApp(tk.Tk):
+    MAX_CANDLES = 5000 # 메모리 관리를 위한 최대 캔들 수
+
     def __init__(self):
         super().__init__()
         self.trade_password = trade_password
@@ -96,7 +98,6 @@ class UpbitChartApp(tk.Tk):
         self._ignore_market_select_event = False
         self.data_bounds = {'x': None, 'y': None}
         self.data_queue = Queue()
-        self.update_loop_counter = 0
 
         self.ma_vars = {'5': tk.BooleanVar(value=True), '20': tk.BooleanVar(value=True), '60': tk.BooleanVar(), '120': tk.BooleanVar()}
         self.bb_var = tk.BooleanVar(value=True)
@@ -150,9 +151,26 @@ class UpbitChartApp(tk.Tk):
             json.dump(self.auto_trade_settings, f, ensure_ascii=False, indent=4)
         print("💾 자동매매 설정 저장 완료.")
 
-    def start_updates(self):
-        self.update_loop()
+    def start_worker_threads(self):
+        """
+        백그라운드 작업을 처리할 장기 실행 워커 스레드를 시작합니다.
+        반복적인 스레드 생성을 피해 시스템 부하를 줄입니다.
+        """
+        data_worker = threading.Thread(target=self.data_update_worker, daemon=True)
+        data_worker.start()
         self.process_queue()
+
+    def data_update_worker(self):
+        """
+        일정 주기마다 가격, 포트폴리오, 마켓 데이터를 조회하는 워커 스레드.
+        """
+        counter = 0
+        while self.is_running:
+            self.fetch_current_price() # 매초 현재가 업데이트
+            if counter % 5 == 0: self._fetch_portfolio_data_worker() # 5초마다 포트폴리오
+            if counter % 10 == 0: self._fetch_market_data_worker() # 10초마다 마켓
+            time.sleep(1)
+            counter += 1
 
     def load_ticker_names(self):
         print("🔍 종목 이름 정보를 로드합니다...")
@@ -244,7 +262,12 @@ class UpbitChartApp(tk.Tk):
         self.ticker_combobox = ttk.Combobox(control_frame_1, textvariable=self.selected_ticker_display, width=20)
         self.ticker_combobox.pack(side="left", padx=(5, 15)); self.ticker_combobox.bind("<<ComboboxSelected>>", self.on_ticker_select)
         ttk.Label(control_frame_1, text="차트 주기:").pack(side="left")
-        intervals = {"5분봉": "minute5", "30분봉": "minute30", "1시간봉": "minute60", "4시간봉": "minute240", "일봉": "day", "주봉": "week"}
+        #intervals = {"5분봉": "minute5", "30분봉": "minute30", "1시간봉": "minute60", "4시간봉": "minute240", "일봉": "day", "주봉": "week"}
+        # '1분봉'을 추가합니다. pyupbit에서 1분봉의 interval 값은 'minute1' 입니다.
+        intervals = {"1분봉": "minute1", "5분봉": "minute5", "30분봉": "minute30", "1시간봉": "minute60", "4시간봉": "minute240", "일봉": "day", "주봉": "week"}
+        #for text, value in intervals.items():
+        #    rb = ttk.Radiobutton(control_frame_1, text=text, variable=self.selected_interval, value=value, command=self.on_ticker_select)
+        #    rb.pack(side="left")
         for text, value in intervals.items():
             rb = ttk.Radiobutton(control_frame_1, text=text, variable=self.selected_interval, value=value, command=self.on_ticker_select)
             rb.pack(side="left")
@@ -401,26 +424,23 @@ class UpbitChartApp(tk.Tk):
         action_button.pack(fill='x', expand=True, ipady=5, pady=(5,0))
 
     def process_queue(self):
+        """
+        데이터 큐에서 하나의 항목을 처리합니다.
+        GUI가 멈추는 것을 방지하기 위해 while 루프 대신 단일 처리 후 self.after를 사용합니다.
+        """
         try:
-            while not self.data_queue.empty():
-                task_name, data = self.data_queue.get_nowait()
-                if task_name == "update_portfolio": self.update_portfolio_gui(*data)
-                elif task_name == "update_market":
-                    self.market_data = data; self._refresh_market_tree_gui()
-                elif task_name == "update_live_candle": self._update_live_data(data)
-                elif task_name == "draw_chart": self._finalize_chart_drawing(*data)
-                elif task_name == "draw_older_chart": self._update_chart_after_loading(*data)
-        except Empty: pass
+            task_name, data = self.data_queue.get_nowait()
+            if task_name == "update_portfolio": self.update_portfolio_gui(*data)
+            elif task_name == "update_market":
+                self.market_data = data; self._refresh_market_tree_gui()
+            elif task_name == "update_live_candle": self._update_live_data(data)
+            elif task_name == "draw_chart": self._finalize_chart_drawing(*data)
+            elif task_name == "draw_older_chart": self._update_chart_after_loading(*data)
+        except Empty:
+            pass
         finally:
-            if self.is_running: self.after(100, self.process_queue)
-
-    def update_loop(self):
-        if not self.is_running: return
-        threading.Thread(target=self.fetch_current_price, daemon=True).start()
-        if self.update_loop_counter % 5 == 0: threading.Thread(target=self._fetch_portfolio_data_worker, daemon=True).start()
-        if self.update_loop_counter % 10 == 0: threading.Thread(target=self._fetch_market_data_worker, daemon=True).start()
-        self.update_loop_counter += 1
-        self.after(1000, self.update_loop)
+            if self.is_running:
+                self.after(100, self.process_queue)
 
     def fetch_current_price(self):
         display_name = self.selected_ticker_display.get()
@@ -507,7 +527,8 @@ class UpbitChartApp(tk.Tk):
         if price < self.master_df.loc[last_idx, 'low']: self.master_df.loc[last_idx, 'low'] = price
         
         current_time = time.time()
-        if current_time - self.last_chart_redraw_time > 1.5:
+        # 1.5초 -> 3.0초로 변경하여 CPU 사용량 감소
+        if current_time - self.last_chart_redraw_time > 3.0:
             cur_xlim, cur_ylim = self.ax.get_xlim(), self.ax.get_ylim()
             self._redraw_chart()
             try:
@@ -707,7 +728,7 @@ class UpbitChartApp(tk.Tk):
             self.buy_price_var.set(""), self.buy_amount_var.set(""), self.buy_total_var.set("")
             self.sell_price_var.set(""), self.sell_amount_var.set(""), self.sell_total_var.set("")
             print("ℹ️ 주문 체결 대기... 2초 후 잔고를 갱신합니다.")
-            self.after(2000, lambda: threading.Thread(target=self._fetch_portfolio_data_worker, daemon=True).start())
+            self.after(2000, self._fetch_portfolio_data_worker)
         except Exception as e:
             messagebox.showerror("주문 실패", f"주문 중 오류가 발생했습니다.\n\n오류 유형: {type(e).__name__}\n메시지: {e}")
             print(f"❗️ 주문 실패: {e}")
@@ -815,7 +836,12 @@ class UpbitChartApp(tk.Tk):
             combined_df_raw = pd.concat([older_df_raw, current_ohlcv])
             combined_df_raw = combined_df_raw[~combined_df_raw.index.duplicated(keep='last')].sort_index()
             df_with_indicators = self.get_technical_indicators_from_raw(combined_df_raw, min_length=2)
+            
             if df_with_indicators is not None and not df_with_indicators.empty:
+                if len(df_with_indicators) > self.MAX_CANDLES:
+                    df_with_indicators = df_with_indicators.iloc[-self.MAX_CANDLES:]
+                    print(f"ℹ️ 메모리 관리를 위해 캔들 데이터를 {self.MAX_CANDLES}개로 제한합니다.")
+                
                 num_candles_added = len(df_with_indicators) - len(self.master_df)
                 if num_candles_added > 0:
                     new_xlim = (current_xlim[0] + num_candles_added, current_xlim[1] + num_candles_added)
@@ -925,6 +951,7 @@ class UpbitChartApp(tk.Tk):
 
     def on_closing(self):
         self.is_running = False
+        time.sleep(1.1) # 워커 스레드가 루프를 마치고 종료될 시간을 줍니다.
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.destroy()
         self.destroy()
@@ -1025,5 +1052,5 @@ class AutoTradeSettingsWindow(tk.Toplevel):
 
 if __name__ == "__main__":
     app = UpbitChartApp()
-    app.start_updates()
+    app.start_worker_threads()
     app.mainloop()
