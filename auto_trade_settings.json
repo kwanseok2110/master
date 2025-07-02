@@ -2,6 +2,5 @@
     "enabled_tickers": [
         "KRW-BTC"
     ],
-    "investment_amount": 5000,
-    "max_additional_buys": 5
+    "total_investment_limit": 30000
 }
